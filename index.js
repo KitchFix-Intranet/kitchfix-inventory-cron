@@ -239,17 +239,35 @@ async function processAccount(accountTab) {
 
   console.log(`[${accountTab}] ${newItems.length} new items (${lineItems.length} total, ${catalog.length} in catalog)`);
 
-  // 4. Call Claude
-  const prompt = buildMatchPrompt(newItems, catalog, aliases);
-  let results;
-  try {
-    const raw = await callClaude(prompt);
-    const cleaned = raw.replace(/```json\s*|```/g, "").trim();
-    const parsed = JSON.parse(cleaned);
-    results = parsed.results || [];
-  } catch (e) {
-    console.error(`[${accountTab}] Claude error: ${e.message}`);
-    return { account: accountTab, processed: newItems.length, matched: 0, created: 0, queued: 0, skipped: 0, error: e.message };
+  // 4. Call Claude in batches of 50 items
+  const BATCH_SIZE = 50;
+  let results = [];
+  for (let batchStart = 0; batchStart < newItems.length; batchStart += BATCH_SIZE) {
+    const batch = newItems.slice(batchStart, batchStart + BATCH_SIZE);
+    const batchNum = Math.floor(batchStart / BATCH_SIZE) + 1;
+    const totalBatches = Math.ceil(newItems.length / BATCH_SIZE);
+    console.log(`[${accountTab}] Batch ${batchNum}/${totalBatches} (${batch.length} items)`);
+
+    const prompt = buildMatchPrompt(batch, catalog, aliases);
+    try {
+      const raw = await callClaude(prompt, 16384);
+      const cleaned = raw.replace(/```json\s*|```/g, "").trim();
+      const parsed = JSON.parse(cleaned);
+      // Offset indices to match original newItems array position
+      const batchResults = (parsed.results || []).map((r) => ({
+        ...r,
+        index: r.index + batchStart,
+      }));
+      results = results.concat(batchResults);
+    } catch (e) {
+      console.error(`[${accountTab}] Batch ${batchNum} Claude error: ${e.message}`);
+      // Continue with other batches instead of failing the whole account
+    }
+
+    // Delay between batches to avoid rate limits
+    if (batchStart + BATCH_SIZE < newItems.length) {
+      await new Promise((r) => setTimeout(r, 2000));
+    }
   }
 
   // 5. Process results
@@ -394,18 +412,11 @@ async function main() {
   console.log(`Threshold: ${MATCH_CONFIDENCE_THRESHOLD}%`);
 
   // Validate env
-console.log("ENV CHECK:", {
-    INVENTORY_SHEET_ID: INVENTORY_SHEET_ID ? "SET" : "MISSING",
-    AI_LINE_ITEMS_SHEET_ID: AI_LINE_ITEMS_SHEET_ID ? "SET" : "MISSING",
-    ANTHROPIC_API_KEY: ANTHROPIC_API_KEY ? "SET" : "MISSING",
-    HUB_SHEET_ID: HUB_SHEET_ID ? "SET" : "MISSING",
-    GOOGLE_SERVICE_ACCOUNT_EMAIL: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL ? "SET" : "MISSING",
-  });
   if (!INVENTORY_SHEET_ID || !AI_LINE_ITEMS_SHEET_ID || !ANTHROPIC_API_KEY) {
     console.error("Missing required env vars. Need: INVENTORY_SHEET_ID, AI_LINE_ITEMS_SHEET_ID, ANTHROPIC_API_KEY");
     process.exit(1);
   }
-  
+
   // Discover account tabs in AI_LINE_ITEMS
   const allTabs = await getTabNames(AI_LINE_ITEMS_SHEET_ID);
   // Filter out metadata tabs
