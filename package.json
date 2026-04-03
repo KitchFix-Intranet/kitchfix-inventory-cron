@@ -1,0 +1,12 @@
+{
+  "name": "kitchfix-inventory-cron",
+  "version": "1.0.0",
+  "description": "Nightly AI catalog matching for KitchFix Inventory Manager",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "googleapis": "^144.0.0"
+  }
+}
