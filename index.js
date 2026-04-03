@@ -163,6 +163,14 @@ MATCHING:
 - If confidence >= 60, return the matched catalogItemId
 - If confidence < 60, this is a new item — provide a clean canonical name
 
+STORAGE LOCATION SUGGESTION (for new items only):
+Suggest where this item is physically stored in a commercial kitchen:
+- "cooler" — fresh proteins, dairy, produce, eggs, fresh herbs, dressings, anything requiring 35-41°F
+- "freezer" — frozen proteins, frozen vegetables, ice cream, frozen bread, anything requiring 0°F or below. Look for keywords: frozen, IQF, flash frozen, frost
+- "dry" — shelf-stable items: canned goods, rice, pasta, flour, sugar, spices, oils, vinegar, dry beans, crackers, chips, snacks, bars, trail mix, candy, cookies
+- "beverage" — water, soda, juice, sports drinks, coffee, tea, energy drinks, milk alternatives for beverage service
+- "supplies" — cleaning chemicals, sanitizer, gloves, foil, plastic wrap, paper towels, trash bags, packaging materials, to-go containers, disposables
+
 RESPOND WITH ONLY valid JSON (no markdown, no backticks, no explanation):
 {
   "results": [
@@ -175,6 +183,7 @@ RESPOND WITH ONLY valid JSON (no markdown, no backticks, no explanation):
       "category": "Food",
       "unit": "case",
       "normalizedPrice": 24.50,
+      "suggestedStorage": "cooler",
       "skipReason": "noise" | "garbled" | "smallwares" | null,
       "isVarietyOf": "parent-item-id-or-null",
       "varietyGroupName": "Brand PackSize"
@@ -326,7 +335,7 @@ async function processAccount(accountTab) {
         newCatalogRows.push([
           itemId, accountTab, r.canonicalName || li.description,
           r.category || "Food", r.unit || li.unit || "EA",
-          "", // locationId — unassigned, EC will set
+          r.suggestedStorage || "dry", // AI-suggested storage keyword — resolved to real locationId when EC sets up locations
           li.vendor, r.normalizedPrice || li.unitPrice,
           li.invoiceDate, li.vendor, "", // priceAtLastCount
           "TRUE", // active
