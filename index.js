@@ -394,11 +394,18 @@ async function main() {
   console.log(`Threshold: ${MATCH_CONFIDENCE_THRESHOLD}%`);
 
   // Validate env
+console.log("ENV CHECK:", {
+    INVENTORY_SHEET_ID: INVENTORY_SHEET_ID ? "SET" : "MISSING",
+    AI_LINE_ITEMS_SHEET_ID: AI_LINE_ITEMS_SHEET_ID ? "SET" : "MISSING",
+    ANTHROPIC_API_KEY: ANTHROPIC_API_KEY ? "SET" : "MISSING",
+    HUB_SHEET_ID: HUB_SHEET_ID ? "SET" : "MISSING",
+    GOOGLE_SERVICE_ACCOUNT_EMAIL: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL ? "SET" : "MISSING",
+  });
   if (!INVENTORY_SHEET_ID || !AI_LINE_ITEMS_SHEET_ID || !ANTHROPIC_API_KEY) {
     console.error("Missing required env vars. Need: INVENTORY_SHEET_ID, AI_LINE_ITEMS_SHEET_ID, ANTHROPIC_API_KEY");
     process.exit(1);
   }
-
+  
   // Discover account tabs in AI_LINE_ITEMS
   const allTabs = await getTabNames(AI_LINE_ITEMS_SHEET_ID);
   // Filter out metadata tabs
