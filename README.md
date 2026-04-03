@@ -42,3 +42,4 @@ node index.js
 ## First Run
 
 On first run, the cron processes ALL historical line items since there's no prior price_history. This is the backfill. Subsequent runs only process invoice UUIDs not yet seen in price_history.
+
