@@ -10,6 +10,12 @@
  * 4. Auto-approve >90% confidence → item_catalog + item_aliases + price_history
  * 5. Queue <90% → review_queue
  * 6. Monday: post catalog health digest to Slack
+ * 
+ * v1.1 — Dedup fixes:
+ *   - Prompt: tightened matching rules + batch_match action for intra-batch dedup
+ *   - Code: post-process results to catch duplicate "new" entries Claude missed
+ *   - Code: sort results so "new" processes before "batch_match"
+ *   - Added: dedupExistingCatalog() one-time cleanup function
  */
 
 const { google } = require("googleapis");
@@ -62,6 +68,18 @@ async function appendRows(spreadsheetId, tabName, rows) {
   }
 }
 
+async function updateRange(spreadsheetId, range, values) {
+  try {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId, range,
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values },
+    });
+  } catch (e) {
+    console.error(`[update] ${range}: ${e.message}`);
+  }
+}
+
 async function getTabNames(spreadsheetId) {
   try {
     const res = await sheets.spreadsheets.get({
@@ -77,6 +95,14 @@ async function getTabNames(spreadsheetId) {
 function uid() {
   const h = () => Math.random().toString(16).slice(2, 10);
   return `${h()}-${h().slice(0, 4)}-${h().slice(0, 4)}-${h()}`;
+}
+
+// ── Normalize name for dedup comparison ──
+function normalizeName(name) {
+  return (name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "") // strip all non-alphanumeric
+    .trim();
 }
 
 // ── Claude API ──
@@ -162,6 +188,23 @@ MATCHING:
   - 0-59: No match (new item)
 - If confidence >= 60, return the matched catalogItemId
 - If confidence < 60, this is a new item — provide a clean canonical name
+- CRITICAL matching rules — these are ALL 95+ confidence matches:
+  - "30 Pack" vs "30pk" vs "30ct" vs "30 count" → SAME ITEM
+  - Missing or extra hyphens, dashes, spaces → SAME ITEM
+  - "Ea" vs "Each" vs "1ct" → same unit
+  - Same brand + same size + same vendor = same item even if word order differs
+  - Same brand + same size + different vendor = MATCH to existing item (different source, same product)
+  - Abbreviations: "Chix" = "Chicken", "Org" = "Organic", "Shrd" = "Shredded", "Med" = "Medium", "Lg" = "Large", "Sm" = "Small"
+
+BATCH DEDUP (CRITICAL — prevents duplicate catalog entries):
+- BEFORE returning results, scan your own output for items that would create the same catalog entry
+- If two or more items in THIS BATCH resolve to the same product:
+  - The FIRST occurrence: action "new" (or "match") as normal
+  - ALL subsequent occurrences of the same product: action "batch_match" with "batchRefIndex" pointing to the first occurrence's index
+  - This ensures only ONE catalog entry is created per unique product per batch
+- Example: index 3 = "Jarritos 24pk" from Grey Eagle, index 17 = "Jarritos 24pk" from Grey Eagle:
+  - Index 3: { "action": "new", "canonicalName": "Jarritos 24pk", ... }
+  - Index 17: { "action": "batch_match", "batchRefIndex": 3, "canonicalName": "Jarritos 24pk", ... }
 
 STORAGE LOCATION SUGGESTION (for new items only):
 Suggest where this item is physically stored in a commercial kitchen:
@@ -176,9 +219,10 @@ RESPOND WITH ONLY valid JSON (no markdown, no backticks, no explanation):
   "results": [
     {
       "index": 0,
-      "action": "match" | "new" | "skip",
+      "action": "match" | "new" | "skip" | "batch_match",
       "confidence": 95,
       "matchedItemId": "existing-item-id-if-matched",
+      "batchRefIndex": null,
       "canonicalName": "Clean Item Name",
       "category": "Food",
       "unit": "case",
@@ -229,12 +273,7 @@ async function processAccount(accountTab) {
     .filter((r) => catalog.some((c) => c.itemId === r[2]))
     .map((r) => ({ aliasId: r[0], aliasText: r[1], canonicalItemId: r[2], vendor: r[3] }));
 
-  // 3. Filter to unprocessed items — skip if invoiceUuid+description already in price_history
-  const processedKeys = new Set(
-    priceRows.filter((r) => r[1] === accountTab).map((r) => `${r[5]}::${r[0]}`) // invoiceId::itemId
-  );
-
-  // For first run or new items: check which invoice UUIDs we haven't seen
+  // 3. Filter to unprocessed items — skip if invoiceUuid already in price_history
   const processedInvoices = new Set(
     priceRows.filter((r) => r[1] === accountTab).map((r) => r[5]) // invoiceId
   );
@@ -266,6 +305,8 @@ async function processAccount(accountTab) {
       const batchResults = (parsed.results || []).map((r) => ({
         ...r,
         index: r.index + batchStart,
+        // Offset batchRefIndex too if present
+        batchRefIndex: r.batchRefIndex != null ? r.batchRefIndex + batchStart : null,
       }));
       results = results.concat(batchResults);
     } catch (e) {
@@ -279,12 +320,49 @@ async function processAccount(accountTab) {
     }
   }
 
+  // ── Post-process: code-level dedup (catches anything Claude missed) ──
+  const newByName = {};
+  for (const r of results) {
+    if (r.action === "new" && r.canonicalName) {
+      const key = normalizeName(r.canonicalName);
+      if (newByName[key] !== undefined) {
+        // Duplicate "new" — convert to batch_match
+        console.log(`[${accountTab}] Dedup: index ${r.index} "${r.canonicalName}" → batch_match of index ${newByName[key]}`);
+        r.action = "batch_match";
+        r.batchRefIndex = newByName[key];
+      } else {
+        newByName[key] = r.index;
+      }
+    }
+  }
+
+  // Also check "new" items against the existing catalog (Claude sometimes misses)
+  for (const r of results) {
+    if (r.action === "new" && r.canonicalName) {
+      const key = normalizeName(r.canonicalName);
+      const existingMatch = catalog.find((c) => normalizeName(c.name) === key);
+      if (existingMatch) {
+        console.log(`[${accountTab}] Dedup vs catalog: index ${r.index} "${r.canonicalName}" matches existing "${existingMatch.name}" (${existingMatch.itemId})`);
+        r.action = "match";
+        r.matchedItemId = existingMatch.itemId;
+        r.confidence = 95;
+      }
+    }
+  }
+
+  // Sort: process "new" before "batch_match" so IDs exist when referenced
+  results.sort((a, b) => {
+    const order = { skip: 0, new: 1, match: 2, batch_match: 3 };
+    return (order[a.action] || 9) - (order[b.action] || 9);
+  });
+
   // 5. Process results
   const now = new Date().toISOString();
   const newCatalogRows = [];
   const newAliasRows = [];
   const newPriceRows = [];
   const newQueueRows = [];
+  const batchNewIds = {}; // index → generated itemId (for batch_match resolution)
   let matched = 0, created = 0, queued = 0, skipped = 0;
 
   for (const r of results) {
@@ -332,10 +410,11 @@ async function processAccount(accountTab) {
         // Genuinely new item → create catalog entry
         created++;
         const itemId = `item_${uid()}`;
+        batchNewIds[r.index] = itemId; // Track for batch_match resolution
         newCatalogRows.push([
           itemId, accountTab, r.canonicalName || li.description,
           r.category || "Food", r.unit || li.unit || "EA",
-          r.suggestedStorage || "dry", // AI-suggested storage keyword — resolved to real locationId when EC sets up locations
+          r.suggestedStorage || "dry", // AI-suggested storage keyword
           li.vendor, r.normalizedPrice || li.unitPrice,
           li.invoiceDate, li.vendor, "", // priceAtLastCount
           "TRUE", // active
@@ -344,6 +423,47 @@ async function processAccount(accountTab) {
           "ai_cron", now, now,
         ]);
         // Also add the original description as an alias
+        newAliasRows.push([
+          `alias_${uid()}`, li.description, itemId,
+          li.vendor, 100, "ai_cron", now, "ai_cron",
+        ]);
+        newPriceRows.push([
+          itemId, accountTab, li.vendor,
+          r.normalizedPrice || li.unitPrice, li.invoiceDate, li.invoiceUuid, now,
+        ]);
+      }
+    }
+
+    if (r.action === "batch_match") {
+      // This item is the same product as another "new" item in this batch
+      const refIndex = r.batchRefIndex;
+      const refItemId = batchNewIds[refIndex];
+      if (refItemId) {
+        // Treat like a match — add alias + price history pointing to the batch-created item
+        matched++;
+        newAliasRows.push([
+          `alias_${uid()}`, li.description, refItemId,
+          li.vendor, 100, "ai_cron_batch", now, "ai_cron",
+        ]);
+        newPriceRows.push([
+          refItemId, accountTab, li.vendor,
+          r.normalizedPrice || li.unitPrice, li.invoiceDate, li.invoiceUuid, now,
+        ]);
+      } else {
+        // Reference not found (edge case) — create as new to avoid data loss
+        console.warn(`[${accountTab}] batch_match ref ${refIndex} not found for index ${r.index}, creating as new`);
+        created++;
+        const itemId = `item_${uid()}`;
+        batchNewIds[r.index] = itemId;
+        newCatalogRows.push([
+          itemId, accountTab, r.canonicalName || li.description,
+          r.category || "Food", r.unit || li.unit || "EA",
+          r.suggestedStorage || "dry",
+          li.vendor, r.normalizedPrice || li.unitPrice,
+          li.invoiceDate, li.vendor, "",
+          "TRUE", "TRUE", r.isVarietyOf ? "TRUE" : "FALSE",
+          "ai_cron", now, now,
+        ]);
         newAliasRows.push([
           `alias_${uid()}`, li.description, itemId,
           li.vendor, 100, "ai_cron", now, "ai_cron",
@@ -414,8 +534,104 @@ async function postSlackDigest(results) {
   }
 }
 
+// ═══════════════════════════════════════
+// ONE-TIME CATALOG DEDUP
+// Run with: DEDUP=1 node index.js
+// ═══════════════════════════════════════
+async function dedupExistingCatalog() {
+  console.log("=== Catalog Dedup ===");
+
+  const [catalogRows, aliasRows, priceRows] = await Promise.all([
+    readTab(INVENTORY_SHEET_ID, "item_catalog"),
+    readTab(INVENTORY_SHEET_ID, "item_aliases"),
+    readTab(INVENTORY_SHEET_ID, "price_history"),
+  ]);
+
+  // Group active items by normalized name + account
+  const groups = {};
+  catalogRows.forEach((r, i) => {
+    if (r[11] === "FALSE") return; // skip inactive
+    const account = r[1] || "";
+    const name = normalizeName(r[2]);
+    const key = `${account}::${name}`;
+    if (!groups[key]) groups[key] = [];
+    groups[key].push({ row: r, rowNum: i + 2, itemId: r[0], name: r[2], lastPriceDate: r[8] || "", locationId: r[5] || "" });
+  });
+
+  let deactivated = 0;
+  const ops = [];
+
+  for (const [key, items] of Object.entries(groups)) {
+    if (items.length <= 1) continue;
+
+    // Keep the item with the most recent price date, or the one with a locationId
+    items.sort((a, b) => {
+      // Prefer item with locationId
+      if (a.locationId && !b.locationId) return -1;
+      if (!a.locationId && b.locationId) return 1;
+      // Then by most recent price date
+      return (b.lastPriceDate || "").localeCompare(a.lastPriceDate || "");
+    });
+    const keeper = items[0];
+    const dupes = items.slice(1);
+
+    console.log(`Dedup: "${keeper.name}" — keeping ${keeper.itemId} (row ${keeper.rowNum}), deactivating ${dupes.length} dupe(s)`);
+
+    for (const dupe of dupes) {
+      // Deactivate the dupe (column L = "FALSE")
+      ops.push({ range: `item_catalog!L${dupe.rowNum}`, values: [["FALSE"]] });
+
+      // Remap aliases pointing to dupe → keeper
+      aliasRows.forEach((a, ai) => {
+        if (a[2] === dupe.itemId) {
+          ops.push({ range: `item_aliases!C${ai + 2}`, values: [[keeper.itemId]] });
+        }
+      });
+
+      // Remap price_history rows → keeper itemId
+      priceRows.forEach((p, pi) => {
+        if (p[0] === dupe.itemId) {
+          ops.push({ range: `price_history!A${pi + 2}`, values: [[keeper.itemId]] });
+        }
+      });
+
+      // If dupe had a locationId and keeper doesn't, copy it
+      if (dupe.locationId && !keeper.locationId) {
+        ops.push({ range: `item_catalog!F${keeper.rowNum}`, values: [[dupe.locationId]] });
+        keeper.locationId = dupe.locationId; // update in memory for subsequent dupes
+      }
+
+      deactivated++;
+    }
+  }
+
+  console.log(`\nWould deactivate ${deactivated} duplicate items across ${ops.length} cell updates.`);
+
+  if (process.env.DEDUP_DRY_RUN !== "false") {
+    console.log("DRY RUN — no changes written. Set DEDUP_DRY_RUN=false to execute.");
+    return { deactivated, operations: ops.length, dryRun: true };
+  }
+
+  // Execute updates
+  console.log("Writing updates...");
+  let written = 0;
+  for (const op of ops) {
+    await updateRange(INVENTORY_SHEET_ID, op.range, op.values);
+    written++;
+    if (written % 50 === 0) console.log(`  ${written}/${ops.length} updates written...`);
+  }
+  console.log(`Done. ${deactivated} duplicates deactivated, ${written} cells updated.`);
+  return { deactivated, operations: written, dryRun: false };
+}
+
 // ── Main ──
 async function main() {
+  // Check for dedup mode
+  if (process.env.DEDUP === "1") {
+    await dedupExistingCatalog();
+    return;
+  }
+
   console.log("=== KitchFix Inventory Cron ===");
   console.log(`Time: ${new Date().toISOString()}`);
   console.log(`Threshold: ${MATCH_CONFIDENCE_THRESHOLD}%`);
