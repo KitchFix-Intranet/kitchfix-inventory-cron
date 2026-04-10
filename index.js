@@ -11,11 +11,12 @@
  * 5. Queue <90% → review_queue
  * 6. Monday: post catalog health digest to Slack
  * 
- * v1.1 — Dedup fixes:
- *   - Prompt: tightened matching rules + batch_match action for intra-batch dedup
- *   - Code: post-process results to catch duplicate "new" entries Claude missed
- *   - Code: sort results so "new" processes before "batch_match"
- *   - Added: dedupExistingCatalog() one-time cleanup function
+ * v1.2 — Fixes:
+ *   - appendRows uses explicit "tab!A1" range (prevents offset column writes)
+ *   - Account matching uses startsWith (handles short vs full account labels)
+ *   - Excluded items check via merge_history (prevents re-importing excluded items)
+ *   - active column filter handles both boolean false and string "FALSE"
+ *   - readTab skips blank/description rows (rows 2-3)
  */
 
 const { google } = require("googleapis");
@@ -42,13 +43,22 @@ function getSheetsClient() {
 
 const sheets = getSheetsClient();
 
+// ── Account matching (handles "STL - MO" vs "STL - MO - St Louis Cardinals") ──
+function accountMatch(rowAccount, activeAccount) {
+  if (!rowAccount || !activeAccount) return false;
+  if (rowAccount === activeAccount) return true;
+  return rowAccount.startsWith(activeAccount + " -") || activeAccount.startsWith(rowAccount + " -");
+}
+
 // ── Sheet Helpers ──
 async function readTab(spreadsheetId, tabName) {
   try {
     const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: tabName });
     const data = res.data.values || [];
     if (data.length <= 1) return []; // header only or empty
-    return data.slice(1); // skip header
+    // Skip header (row 1), blank row (row 2), description row (row 3)
+    // Filter: rows must have a value in column A to be real data
+    return data.slice(1).filter(r => r[0] && !String(r[0]).startsWith("One row") && !String(r[0]).startsWith("Multiple") && !String(r[0]).startsWith("Every ") && !String(r[0]).startsWith("Per-account") && !String(r[0]).startsWith("Append-only") && !String(r[0]).startsWith("Pending"));
   } catch (e) {
     console.warn(`[read] ${tabName}: ${e.message}`);
     return [];
@@ -57,9 +67,13 @@ async function readTab(spreadsheetId, tabName) {
 
 async function appendRows(spreadsheetId, tabName, rows) {
   if (!rows.length) return;
+  // CRITICAL: Use "tab!A1" range to force append at column A
+  // Using bare tab name causes Sheets to detect existing data boundaries
+  // and append at the wrong column position
+  const range = tabName.includes("!") ? tabName : `${tabName}!A1`;
   try {
     await sheets.spreadsheets.values.append({
-      spreadsheetId, range: tabName,
+      spreadsheetId, range,
       valueInputOption: "USER_ENTERED",
       requestBody: { values: rows },
     });
@@ -255,15 +269,17 @@ async function processAccount(accountTab) {
     category: r[12] || "other",
   }));
 
-  // 2. Read existing catalog + aliases + price_history for this account
-  const [catalogRows, aliasRows, priceRows] = await Promise.all([
+  // 2. Read existing catalog + aliases + price_history + merge_history for this account
+  const [catalogRows, aliasRows, priceRows, mergeRows] = await Promise.all([
     readTab(INVENTORY_SHEET_ID, "item_catalog"),
     readTab(INVENTORY_SHEET_ID, "item_aliases"),
     readTab(INVENTORY_SHEET_ID, "price_history"),
+    readTab(INVENTORY_SHEET_ID, "merge_history"),
   ]);
 
+  // Use accountMatch for flexible matching (short label vs full label)
   const catalog = catalogRows
-    .filter((r) => r[1] === accountTab && r[11] !== "FALSE")
+    .filter((r) => accountMatch(r[1], accountTab) && r[11] !== "FALSE" && r[11] !== false)
     .map((r) => ({
       itemId: r[0], name: r[2], category: r[3], unit: r[4],
       locationId: r[5], primaryVendor: r[6], lastPrice: r[7],
@@ -273,9 +289,22 @@ async function processAccount(accountTab) {
     .filter((r) => catalog.some((c) => c.itemId === r[2]))
     .map((r) => ({ aliasId: r[0], aliasText: r[1], canonicalItemId: r[2], vendor: r[3] }));
 
+  // Build excluded items set from merge_history (action="exclude")
+  const excludedNames = new Set();
+  mergeRows.forEach((r) => {
+    // merge_history columns: mergeId[0], account[1], timestamp[2], email[3], keeperItemId[4], keeperName[5], mergedItemIds[6], mergedNames[7], action[8], aiGroupId[9]
+    if (r[8] === "exclude" && accountMatch(r[1], accountTab)) {
+      const name = normalizeName(r[5]); // keeperName has the item name
+      if (name) excludedNames.add(name);
+    }
+  });
+  if (excludedNames.size > 0) {
+    console.log(`[${accountTab}] ${excludedNames.size} excluded item(s) will be skipped`);
+  }
+
   // 3. Filter to unprocessed items — skip if invoiceUuid already in price_history
   const processedInvoices = new Set(
-    priceRows.filter((r) => r[1] === accountTab).map((r) => r[5]) // invoiceId
+    priceRows.filter((r) => accountMatch(r[1], accountTab)).map((r) => r[5]) // invoiceId
   );
 
   const newItems = lineItems.filter((li) => !processedInvoices.has(li.invoiceUuid));
@@ -346,6 +375,18 @@ async function processAccount(accountTab) {
         r.action = "match";
         r.matchedItemId = existingMatch.itemId;
         r.confidence = 95;
+      }
+    }
+  }
+
+  // Check "new" items against excluded items — skip if name matches
+  for (const r of results) {
+    if (r.action === "new" && r.canonicalName) {
+      const key = normalizeName(r.canonicalName);
+      if (excludedNames.has(key)) {
+        console.log(`[${accountTab}] Excluded: index ${r.index} "${r.canonicalName}" was previously removed from inventory`);
+        r.action = "skip";
+        r.skipReason = "excluded";
       }
     }
   }
@@ -476,11 +517,11 @@ async function processAccount(accountTab) {
     }
   }
 
-  // 6. Write results
-  if (newCatalogRows.length) await appendRows(INVENTORY_SHEET_ID, "item_catalog", newCatalogRows);
-  if (newAliasRows.length) await appendRows(INVENTORY_SHEET_ID, "item_aliases", newAliasRows);
-  if (newPriceRows.length) await appendRows(INVENTORY_SHEET_ID, "price_history", newPriceRows);
-  if (newQueueRows.length) await appendRows(INVENTORY_SHEET_ID, "review_queue", newQueueRows);
+  // 6. Write results — CRITICAL: use "tab!A1" range to prevent offset writes
+  if (newCatalogRows.length) await appendRows(INVENTORY_SHEET_ID, "item_catalog!A1", newCatalogRows);
+  if (newAliasRows.length) await appendRows(INVENTORY_SHEET_ID, "item_aliases!A1", newAliasRows);
+  if (newPriceRows.length) await appendRows(INVENTORY_SHEET_ID, "price_history!A1", newPriceRows);
+  if (newQueueRows.length) await appendRows(INVENTORY_SHEET_ID, "review_queue!A1", newQueueRows);
 
   const summary = { account: accountTab, processed: newItems.length, matched, created, queued, skipped };
   console.log(`[${accountTab}] Done:`, JSON.stringify(summary));
@@ -550,7 +591,7 @@ async function dedupExistingCatalog() {
   // Group active items by normalized name + account
   const groups = {};
   catalogRows.forEach((r, i) => {
-    if (r[11] === "FALSE") return; // skip inactive
+    if (r[11] === "FALSE" || r[11] === false) return; // skip inactive
     const account = r[1] || "";
     const name = normalizeName(r[2]);
     const key = `${account}::${name}`;
