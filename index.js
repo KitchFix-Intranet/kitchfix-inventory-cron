@@ -119,6 +119,19 @@ function normalizeName(name) {
     .trim();
 }
 
+// ── Arithmetic gate: catches bad OCR reads at the price chokepoint. ──
+// Holds: |qty*unitPrice - extendedPrice| <= 2% of |extendedPrice| + 0.01
+// Tolerates rounding / cents drift; catches order-of-magnitude misreads.
+// Lines that fail this gate are NOT promoted to price_history /
+// item_catalog; they route to review_queue with reason="arithmetic_fail".
+// Module 8 will add the price-vs-history outlier check on top of this.
+function arithmeticCheck(li) {
+  const calc = (Number(li.quantity) || 0) * (Number(li.unitPrice) || 0);
+  const ext = Number(li.extendedPrice) || 0;
+  const tol = 0.02 * Math.abs(ext) + 0.01;
+  return Math.abs(calc - ext) <= tol;
+}
+
 // ── Claude API ──
 async function callClaude(prompt, maxTokens = 8192) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -404,7 +417,7 @@ async function processAccount(accountTab) {
   const newPriceRows = [];
   const newQueueRows = [];
   const batchNewIds = {}; // index → generated itemId (for batch_match resolution)
-  let matched = 0, created = 0, queued = 0, skipped = 0;
+  let matched = 0, created = 0, queued = 0, held = 0, skipped = 0;
 
   for (const r of results) {
     const li = newItems[r.index];
@@ -412,6 +425,28 @@ async function processAccount(accountTab) {
 
     if (r.action === "skip") {
       skipped++;
+      continue;
+    }
+
+    // Arithmetic gate at the price-write chokepoint. Applies only to
+    // actions that would otherwise promote to price_history /
+    // item_catalog (match-high-conf, new-genuine, batch_match). The
+    // low-confidence-match and possible-new branches already route to
+    // review_queue with their own reasons; arithmetic is checked on the
+    // promotion path so bad reads can't corrupt prices.
+    const wouldPromote =
+      (r.action === "match" && r.matchedItemId && r.confidence >= MATCH_CONFIDENCE_THRESHOLD) ||
+      (r.action === "new" && !(r.confidence !== undefined && r.confidence >= 60)) ||
+      (r.action === "batch_match");
+    if (wouldPromote && !arithmeticCheck(li)) {
+      held++;
+      newQueueRows.push([
+        `q_${uid()}`, li.description, li.vendor, li.invoiceUuid,
+        li.invoiceDate, accountTab,
+        r.matchedItemId || "", r.canonicalName || li.description,
+        r.confidence ?? 0, "pending",
+        "", "", "", "arithmetic_fail",
+      ]);
       continue;
     }
 
@@ -433,7 +468,8 @@ async function processAccount(accountTab) {
         newQueueRows.push([
           `q_${uid()}`, li.description, li.vendor, li.invoiceUuid,
           li.invoiceDate, accountTab, r.matchedItemId,
-          r.canonicalName || "", r.confidence, "pending", "", "", "",
+          r.canonicalName || "", r.confidence, "pending",
+          "", "", "", "low_match_confidence",
         ]);
       }
     }
@@ -445,7 +481,8 @@ async function processAccount(accountTab) {
         newQueueRows.push([
           `q_${uid()}`, li.description, li.vendor, li.invoiceUuid,
           li.invoiceDate, accountTab, r.matchedItemId || "",
-          r.canonicalName || "", r.confidence || 0, "pending", "", "", "",
+          r.canonicalName || "", r.confidence || 0, "pending",
+          "", "", "", "possible_new",
         ]);
       } else {
         // Genuinely new item → create catalog entry
@@ -523,7 +560,7 @@ async function processAccount(accountTab) {
   if (newPriceRows.length) await appendRows(INVENTORY_SHEET_ID, "price_history!A1", newPriceRows);
   if (newQueueRows.length) await appendRows(INVENTORY_SHEET_ID, "review_queue!A1", newQueueRows);
 
-  const summary = { account: accountTab, processed: newItems.length, matched, created, queued, skipped };
+  const summary = { account: accountTab, processed: newItems.length, matched, created, queued, held, skipped };
   console.log(`[${accountTab}] Done:`, JSON.stringify(summary));
   return summary;
 }
@@ -543,12 +580,18 @@ async function postSlackDigest(results) {
   });
 
   let text = "*🔄 Inventory Cron — Nightly Run*\n";
+  let totalHeld = 0;
   for (const r of results) {
     if (r.processed > 0 || r.error) {
-      text += `• *${r.account}*: ${r.matched} matched, ${r.created} new, ${r.queued} queued, ${r.skipped} skipped`;
+      const heldPart = r.held ? `, ${r.held} held` : "";
+      text += `• *${r.account}*: ${r.matched} matched, ${r.created} new, ${r.queued} queued${heldPart}, ${r.skipped} skipped`;
       if (r.error) text += ` ⚠️ ${r.error}`;
       text += "\n";
+      totalHeld += r.held || 0;
     }
+  }
+  if (totalHeld > 0) {
+    text += `\n*⚠️ ${totalHeld} line(s) held by arithmetic gate (reason="arithmetic_fail" in review_queue)*\n`;
   }
 
   if (isMonday) {
