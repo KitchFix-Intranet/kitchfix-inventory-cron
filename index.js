@@ -320,7 +320,40 @@ async function processAccount(accountTab) {
     priceRows.filter((r) => accountMatch(r[1], accountTab)).map((r) => r[5]) // invoiceId
   );
 
-  const newItems = lineItems.filter((li) => !processedInvoices.has(li.invoiceUuid));
+  let newItems = lineItems.filter((li) => !processedInvoices.has(li.invoiceUuid));
+
+  // Invoice-level holds. review_queue rows tagged
+  // reason='overcount_suspect_reextract' flag entire invoices whose
+  // extracted line totals exceed the invoice total (real + fabricated
+  // mix). Their lines stay in ai_line_items for audit and future
+  // re-source; they do NOT promote here. Backfill or chef resolver
+  // writes these rows. Filtered out of newItems before the Claude
+  // call so they never reach the matching pass.
+  const queueRowsForHolds = await readTab(INVENTORY_SHEET_ID, "review_queue");
+  const heldInvoiceUuids = new Set();
+  for (const r of queueRowsForHolds) {
+    if (String(r[13] || "").trim() === "overcount_suspect_reextract" && accountMatch(r[5], accountTab)) {
+      const inv = String(r[3] || "").trim();
+      if (inv) heldInvoiceUuids.add(inv);
+    }
+  }
+  let invoiceHoldsHonored = 0, linesDeferredByHold = 0;
+  if (heldInvoiceUuids.size > 0) {
+    const wasCount = newItems.length;
+    const skippedSet = new Set();
+    newItems = newItems.filter((li) => {
+      if (heldInvoiceUuids.has(li.invoiceUuid)) {
+        skippedSet.add(li.invoiceUuid);
+        return false;
+      }
+      return true;
+    });
+    invoiceHoldsHonored = skippedSet.size;
+    linesDeferredByHold = wasCount - newItems.length;
+    if (linesDeferredByHold > 0) {
+      console.log(`[${accountTab}] honored invoice-level holds: ${invoiceHoldsHonored} invoice(s), ${linesDeferredByHold} line(s) deferred (reason=overcount_suspect_reextract)`);
+    }
+  }
 
   if (newItems.length === 0) {
     console.log(`[${accountTab}] All ${lineItems.length} items already processed.`);
@@ -560,7 +593,7 @@ async function processAccount(accountTab) {
   if (newPriceRows.length) await appendRows(INVENTORY_SHEET_ID, "price_history!A1", newPriceRows);
   if (newQueueRows.length) await appendRows(INVENTORY_SHEET_ID, "review_queue!A1", newQueueRows);
 
-  const summary = { account: accountTab, processed: newItems.length, matched, created, queued, held, skipped };
+  const summary = { account: accountTab, processed: newItems.length, matched, created, queued, held, skipped, invoiceHoldsHonored, linesDeferredByHold };
   console.log(`[${accountTab}] Done:`, JSON.stringify(summary));
   return summary;
 }
@@ -581,17 +614,24 @@ async function postSlackDigest(results) {
 
   let text = "*🔄 Inventory Cron — Nightly Run*\n";
   let totalHeld = 0;
+  let totalInvoiceHolds = 0, totalLinesDeferred = 0;
   for (const r of results) {
-    if (r.processed > 0 || r.error) {
+    if (r.processed > 0 || r.error || r.linesDeferredByHold) {
       const heldPart = r.held ? `, ${r.held} held` : "";
-      text += `• *${r.account}*: ${r.matched} matched, ${r.created} new, ${r.queued} queued${heldPart}, ${r.skipped} skipped`;
+      const deferredPart = r.linesDeferredByHold ? `, ${r.linesDeferredByHold} deferred (${r.invoiceHoldsHonored} held invoice${r.invoiceHoldsHonored === 1 ? "" : "s"})` : "";
+      text += `• *${r.account}*: ${r.matched} matched, ${r.created} new, ${r.queued} queued${heldPart}${deferredPart}, ${r.skipped} skipped`;
       if (r.error) text += ` ⚠️ ${r.error}`;
       text += "\n";
       totalHeld += r.held || 0;
+      totalInvoiceHolds += r.invoiceHoldsHonored || 0;
+      totalLinesDeferred += r.linesDeferredByHold || 0;
     }
   }
   if (totalHeld > 0) {
     text += `\n*⚠️ ${totalHeld} line(s) held by arithmetic gate (reason="arithmetic_fail" in review_queue)*\n`;
+  }
+  if (totalInvoiceHolds > 0) {
+    text += `*⏸ ${totalInvoiceHolds} invoice(s) deferred entirely (${totalLinesDeferred} line(s)) by overcount_suspect_reextract flag*\n`;
   }
 
   if (isMonday) {
