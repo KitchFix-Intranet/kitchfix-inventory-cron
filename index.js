@@ -796,6 +796,23 @@ async function main() {
   const totalCreated = results.reduce((s, r) => s + (r.created || 0), 0);
   const totalMatched = results.reduce((s, r) => s + (r.matched || 0), 0);
   console.log(`Total: ${totalProcessed} processed, ${totalMatched} matched, ${totalCreated} created`);
+
+  // ── Reconciliation alarm (D10 safety net) ──
+  // Runs as the tail of the cron pass so every cron-side write is visible
+  // to the comparison. Failures here LOG but do NOT change the cron's
+  // exit code — the cron's own work succeeded regardless of whether the
+  // alarm can post its digest. Requires SUPABASE_URL +
+  // SUPABASE_SERVICE_ROLE_KEY + DUAL_WRITE_TABLES on top of the env vars
+  // the cron already uses (GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_PRIVATE_KEY,
+  // SLACK_RECAP_WEBHOOK reused).
+  try {
+    console.log("\n=== Reconciliation Alarm ===");
+    const { runReconciliationAlarm } = await import("./reconciliation-alarm.mjs");
+    const result = await runReconciliationAlarm();
+    console.log(`[recon-alarm] complete; alarm=${result.alarm}`);
+  } catch (e) {
+    console.error("[recon-alarm] failed (cron exit unaffected):", e.message);
+  }
 }
 
 main().catch((e) => {
