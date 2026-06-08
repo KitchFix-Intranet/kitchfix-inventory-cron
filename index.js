@@ -20,6 +20,7 @@
  */
 
 const { google } = require("googleapis");
+const shapes = require("./row-shapes.js");
 
 // ── Config ──
 const INVENTORY_SHEET_ID = process.env.INVENTORY_SHEET_ID;
@@ -28,6 +29,32 @@ const HUB_SHEET_ID = process.env.HUB_SHEET_ID;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const MATCH_CONFIDENCE_THRESHOLD = parseInt(process.env.MATCH_CONFIDENCE_THRESHOLD || "90");
 const SLACK_RECAP_WEBHOOK = process.env.SLACK_RECAP_WEBHOOK;
+
+// PR 8.3: cron-to-PG migration flag. 4 modes:
+//   false       (default) - Sheets-only writes, today's behavior, no PG access
+//   dry-run     - Sheets writes as today + PG reads (dedup union + vendor maps) +
+//                 transforms run to compute "would write" + Slack digest. NO PG writes.
+//   dual-write  - NOT YET IMPLEMENTED. Reserved for the next PR.
+//   pg-only     - NOT YET IMPLEMENTED. Reserved for the post-cutover PR.
+const CRON_USE_POSTGRES = (process.env.CRON_USE_POSTGRES || "false").trim();
+const VALID_PG_MODES = new Set(["false", "dry-run", "dual-write", "pg-only"]);
+if (!VALID_PG_MODES.has(CRON_USE_POSTGRES)) {
+  console.error(
+    `[cron] Invalid CRON_USE_POSTGRES="${CRON_USE_POSTGRES}". ` +
+    `Valid: ${[...VALID_PG_MODES].join(" / ")}.`
+  );
+  process.exit(2);
+}
+if (CRON_USE_POSTGRES === "dual-write" || CRON_USE_POSTGRES === "pg-only") {
+  console.error(
+    `[cron] CRON_USE_POSTGRES="${CRON_USE_POSTGRES}" not yet implemented. ` +
+    `PR 8.3 ships "false" + "dry-run" only. ` +
+    `Set CRON_USE_POSTGRES=dry-run to validate transforms, or unset for current behavior.`
+  );
+  process.exit(2);
+}
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 // ── Sheets Auth ──
 function getSheetsClient() {
@@ -264,7 +291,12 @@ RESPOND WITH ONLY valid JSON (no markdown, no backticks, no explanation):
 }
 
 // ── Process One Account ──
-async function processAccount(accountTab) {
+// pgCtx (optional): { supa, shared, vendorMaps, module } - set when
+// CRON_USE_POSTGRES === "dry-run". Triggers PG dedup read (union with
+// Sheets), PG row-array transform after Claude results, and the per-
+// account diff that main() collects for the Slack digest. Writes nothing
+// to PG.
+async function processAccount(accountTab, pgCtx) {
   console.log(`\n[${accountTab}] Processing...`);
 
   // 1. Read line items from AI_LINE_ITEMS
@@ -316,9 +348,25 @@ async function processAccount(accountTab) {
   }
 
   // 3. Filter to unprocessed items — skip if invoiceUuid already in price_history
-  const processedInvoices = new Set(
+  const sheetsProcessedInvoices = new Set(
     priceRows.filter((r) => accountMatch(r[1], accountTab)).map((r) => r[5]) // invoiceId
   );
+
+  // PR 8.3 dry-run: also read PG-side processed invoices for the dedup union.
+  // Over-skip (union) rather than re-process (intersection) so divergence
+  // between Sheets and PG never causes the cron to re-write a row that
+  // either side already has.
+  let pgProcessedInvoices = new Set();
+  if (pgCtx) {
+    try {
+      pgProcessedInvoices = await pgCtx.module.readPGProcessedInvoices(pgCtx, accountTab);
+    } catch (e) {
+      console.error(`[${accountTab}] [pg-dry-run] PG processed-invoices read failed (falling back to Sheets-only dedup):`, e.message);
+    }
+  }
+  const processedInvoices = pgCtx
+    ? new Set([...sheetsProcessedInvoices, ...pgProcessedInvoices])
+    : sheetsProcessedInvoices;
 
   let newItems = lineItems.filter((li) => !processedInvoices.has(li.invoiceUuid));
 
@@ -473,13 +521,22 @@ async function processAccount(accountTab) {
       (r.action === "batch_match");
     if (wouldPromote && !arithmeticCheck(li)) {
       held++;
-      newQueueRows.push([
-        `q_${uid()}`, li.description, li.vendor, li.invoiceUuid,
-        li.invoiceDate, accountTab,
-        r.matchedItemId || "", r.canonicalName || li.description,
-        r.confidence ?? 0, "pending",
-        "", "", "", "arithmetic_fail",
-      ]);
+      newQueueRows.push(shapes.makeQueueRow({
+        queueId:            `q_${uid()}`,
+        lineItemText:       li.description,
+        vendor:             li.vendor,
+        invoiceUuid:        li.invoiceUuid,
+        invoiceDate:        li.invoiceDate,
+        account:            accountTab,
+        suggestedMatchId:   r.matchedItemId || "",
+        suggestedMatchName: r.canonicalName || li.description,
+        confidence:         r.confidence ?? 0,
+        status:             "pending",
+        reserved10:         "",
+        reserved11:         "",
+        reserved12:         "",
+        reason:             "arithmetic_fail",
+      }));
       continue;
     }
 
@@ -487,23 +544,44 @@ async function processAccount(accountTab) {
       if (r.confidence >= MATCH_CONFIDENCE_THRESHOLD) {
         // Auto-approve: add alias + update price
         matched++;
-        newAliasRows.push([
-          `alias_${uid()}`, li.description, r.matchedItemId,
-          li.vendor, r.confidence, "ai_cron", now, "ai_cron",
-        ]);
-        newPriceRows.push([
-          r.matchedItemId, accountTab, li.vendor,
-          r.normalizedPrice || li.unitPrice, li.invoiceDate, li.invoiceUuid, now,
-        ]);
+        newAliasRows.push(shapes.makeAliasRow({
+          aliasId:    `alias_${uid()}`,
+          aliasText:  li.description,
+          itemId:     r.matchedItemId,
+          vendor:     li.vendor,
+          confidence: r.confidence,
+          learnedBy:  "ai_cron",
+          learnedAt:  now,
+          source:     "ai_cron",
+        }));
+        newPriceRows.push(shapes.makePriceRow({
+          itemId:      r.matchedItemId,
+          account:     accountTab,
+          vendor:      li.vendor,
+          price:       r.normalizedPrice || li.unitPrice,
+          invoiceDate: li.invoiceDate,
+          invoiceUuid: li.invoiceUuid,
+          recordedAt:  now,
+        }));
       } else {
         // Low confidence → queue for review
         queued++;
-        newQueueRows.push([
-          `q_${uid()}`, li.description, li.vendor, li.invoiceUuid,
-          li.invoiceDate, accountTab, r.matchedItemId,
-          r.canonicalName || "", r.confidence, "pending",
-          "", "", "", "low_match_confidence",
-        ]);
+        newQueueRows.push(shapes.makeQueueRow({
+          queueId:            `q_${uid()}`,
+          lineItemText:       li.description,
+          vendor:             li.vendor,
+          invoiceUuid:        li.invoiceUuid,
+          invoiceDate:        li.invoiceDate,
+          account:            accountTab,
+          suggestedMatchId:   r.matchedItemId,
+          suggestedMatchName: r.canonicalName || "",
+          confidence:         r.confidence,
+          status:             "pending",
+          reserved10:         "",
+          reserved11:         "",
+          reserved12:         "",
+          reason:             "low_match_confidence",
+        }));
       }
     }
 
@@ -511,37 +589,66 @@ async function processAccount(accountTab) {
       if (r.confidence !== undefined && r.confidence >= 60) {
         // Actually a possible match that should be reviewed
         queued++;
-        newQueueRows.push([
-          `q_${uid()}`, li.description, li.vendor, li.invoiceUuid,
-          li.invoiceDate, accountTab, r.matchedItemId || "",
-          r.canonicalName || "", r.confidence || 0, "pending",
-          "", "", "", "possible_new",
-        ]);
+        newQueueRows.push(shapes.makeQueueRow({
+          queueId:            `q_${uid()}`,
+          lineItemText:       li.description,
+          vendor:             li.vendor,
+          invoiceUuid:        li.invoiceUuid,
+          invoiceDate:        li.invoiceDate,
+          account:            accountTab,
+          suggestedMatchId:   r.matchedItemId || "",
+          suggestedMatchName: r.canonicalName || "",
+          confidence:         r.confidence || 0,
+          status:             "pending",
+          reserved10:         "",
+          reserved11:         "",
+          reserved12:         "",
+          reason:             "possible_new",
+        }));
       } else {
         // Genuinely new item → create catalog entry
         created++;
         const itemId = `item_${uid()}`;
         batchNewIds[r.index] = itemId; // Track for batch_match resolution
-        newCatalogRows.push([
-          itemId, accountTab, r.canonicalName || li.description,
-          r.category || "Food", r.unit || li.unit || "EA",
-          r.suggestedStorage || "dry", // AI-suggested storage keyword
-          li.vendor, r.normalizedPrice || li.unitPrice,
-          li.invoiceDate, li.vendor, "", // priceAtLastCount
-          "TRUE", // active
-          "TRUE", // linkedToInvoice
-          r.isVarietyOf ? "TRUE" : "FALSE", // isVarietyGroup
-          "ai_cron", now, now,
-        ]);
+        newCatalogRows.push(shapes.makeCatalogRow({
+          itemId:           itemId,
+          account:          accountTab,
+          name:             r.canonicalName || li.description,
+          category:         r.category || "Food",
+          unit:             r.unit || li.unit || "EA",
+          storage:          r.suggestedStorage || "dry",
+          vendor:           li.vendor,
+          price:            r.normalizedPrice || li.unitPrice,
+          invoiceDate:      li.invoiceDate,
+          vendor2:          li.vendor,
+          priceAtLastCount: "",
+          active:           "TRUE",
+          linkedToInvoice:  "TRUE",
+          isVariety:        r.isVarietyOf ? "TRUE" : "FALSE",
+          createdBy:        "ai_cron",
+          createdAt:        now,
+          updatedAt:        now,
+        }));
         // Also add the original description as an alias
-        newAliasRows.push([
-          `alias_${uid()}`, li.description, itemId,
-          li.vendor, 100, "ai_cron", now, "ai_cron",
-        ]);
-        newPriceRows.push([
-          itemId, accountTab, li.vendor,
-          r.normalizedPrice || li.unitPrice, li.invoiceDate, li.invoiceUuid, now,
-        ]);
+        newAliasRows.push(shapes.makeAliasRow({
+          aliasId:    `alias_${uid()}`,
+          aliasText:  li.description,
+          itemId:     itemId,
+          vendor:     li.vendor,
+          confidence: 100,
+          learnedBy:  "ai_cron",
+          learnedAt:  now,
+          source:     "ai_cron",
+        }));
+        newPriceRows.push(shapes.makePriceRow({
+          itemId:      itemId,
+          account:     accountTab,
+          vendor:      li.vendor,
+          price:       r.normalizedPrice || li.unitPrice,
+          invoiceDate: li.invoiceDate,
+          invoiceUuid: li.invoiceUuid,
+          recordedAt:  now,
+        }));
       }
     }
 
@@ -552,37 +659,69 @@ async function processAccount(accountTab) {
       if (refItemId) {
         // Treat like a match — add alias + price history pointing to the batch-created item
         matched++;
-        newAliasRows.push([
-          `alias_${uid()}`, li.description, refItemId,
-          li.vendor, 100, "ai_cron_batch", now, "ai_cron",
-        ]);
-        newPriceRows.push([
-          refItemId, accountTab, li.vendor,
-          r.normalizedPrice || li.unitPrice, li.invoiceDate, li.invoiceUuid, now,
-        ]);
+        newAliasRows.push(shapes.makeAliasRow({
+          aliasId:    `alias_${uid()}`,
+          aliasText:  li.description,
+          itemId:     refItemId,
+          vendor:     li.vendor,
+          confidence: 100,
+          learnedBy:  "ai_cron_batch",
+          learnedAt:  now,
+          source:     "ai_cron",
+        }));
+        newPriceRows.push(shapes.makePriceRow({
+          itemId:      refItemId,
+          account:     accountTab,
+          vendor:      li.vendor,
+          price:       r.normalizedPrice || li.unitPrice,
+          invoiceDate: li.invoiceDate,
+          invoiceUuid: li.invoiceUuid,
+          recordedAt:  now,
+        }));
       } else {
         // Reference not found (edge case) — create as new to avoid data loss
         console.warn(`[${accountTab}] batch_match ref ${refIndex} not found for index ${r.index}, creating as new`);
         created++;
         const itemId = `item_${uid()}`;
         batchNewIds[r.index] = itemId;
-        newCatalogRows.push([
-          itemId, accountTab, r.canonicalName || li.description,
-          r.category || "Food", r.unit || li.unit || "EA",
-          r.suggestedStorage || "dry",
-          li.vendor, r.normalizedPrice || li.unitPrice,
-          li.invoiceDate, li.vendor, "",
-          "TRUE", "TRUE", r.isVarietyOf ? "TRUE" : "FALSE",
-          "ai_cron", now, now,
-        ]);
-        newAliasRows.push([
-          `alias_${uid()}`, li.description, itemId,
-          li.vendor, 100, "ai_cron", now, "ai_cron",
-        ]);
-        newPriceRows.push([
-          itemId, accountTab, li.vendor,
-          r.normalizedPrice || li.unitPrice, li.invoiceDate, li.invoiceUuid, now,
-        ]);
+        newCatalogRows.push(shapes.makeCatalogRow({
+          itemId:           itemId,
+          account:          accountTab,
+          name:             r.canonicalName || li.description,
+          category:         r.category || "Food",
+          unit:             r.unit || li.unit || "EA",
+          storage:          r.suggestedStorage || "dry",
+          vendor:           li.vendor,
+          price:            r.normalizedPrice || li.unitPrice,
+          invoiceDate:      li.invoiceDate,
+          vendor2:          li.vendor,
+          priceAtLastCount: "",
+          active:           "TRUE",
+          linkedToInvoice:  "TRUE",
+          isVariety:        r.isVarietyOf ? "TRUE" : "FALSE",
+          createdBy:        "ai_cron",
+          createdAt:        now,
+          updatedAt:        now,
+        }));
+        newAliasRows.push(shapes.makeAliasRow({
+          aliasId:    `alias_${uid()}`,
+          aliasText:  li.description,
+          itemId:     itemId,
+          vendor:     li.vendor,
+          confidence: 100,
+          learnedBy:  "ai_cron",
+          learnedAt:  now,
+          source:     "ai_cron",
+        }));
+        newPriceRows.push(shapes.makePriceRow({
+          itemId:      itemId,
+          account:     accountTab,
+          vendor:      li.vendor,
+          price:       r.normalizedPrice || li.unitPrice,
+          invoiceDate: li.invoiceDate,
+          invoiceUuid: li.invoiceUuid,
+          recordedAt:  now,
+        }));
       }
     }
   }
@@ -594,7 +733,51 @@ async function processAccount(accountTab) {
   if (newQueueRows.length) await appendRows(INVENTORY_SHEET_ID, "review_queue!A1", newQueueRows);
 
   const summary = { account: accountTab, processed: newItems.length, matched, created, queued, held, skipped, invoiceHoldsHonored, linesDeferredByHold };
-  console.log(`[${accountTab}] Done:`, JSON.stringify(summary));
+
+  // PR 8.3 dry-run: transform the Sheets row arrays into PG row shape,
+  // compute the dedup divergence, attach the per-account diff to the
+  // summary so main() can post the aggregate digest. Writes NOTHING to PG.
+  if (pgCtx) {
+    try {
+      const { rows: pgRows, skips } = pgCtx.module.buildPGRowArrays(pgCtx, {
+        catalog: newCatalogRows,
+        aliases: newAliasRows,
+        prices:  newPriceRows,
+        queue:   newQueueRows,
+      });
+      const divergence = pgCtx.module.computeDedupDivergence(sheetsProcessedInvoices, pgProcessedInvoices);
+      summary.pgDryRun = {
+        account: accountTab,
+        would: {
+          catalog: pgRows.catalog.length,
+          aliases: pgRows.aliases.length,
+          prices:  pgRows.prices.length,
+          queue:   pgRows.queue.length,
+        },
+        skips: {
+          totalRowsSkipped: skips.totalRowsSkipped,
+          categoryInvalid: skips.categoryInvalid,
+          vendorUnresolved: skips.vendorUnresolved,
+        },
+        divergence,
+      };
+      console.log(`[${accountTab}] PG dry-run diff:`);
+      console.log(`  would write to PG: ${pgRows.catalog.length}c / ${pgRows.aliases.length}a / ${pgRows.prices.length}p / ${pgRows.queue.length}q`);
+      if (skips.totalRowsSkipped > 0) {
+        const vendors = [...skips.vendorUnresolved.keys()];
+        console.log(`  skipped ${skips.totalRowsSkipped} row(s) for ${vendors.length} unresolved vendor(s): ${vendors.slice(0, 5).map((v) => `"${v}"`).join(", ")}${vendors.length > 5 ? ` (+${vendors.length - 5} more)` : ""}`);
+      }
+      if (skips.categoryInvalid > 0) {
+        console.log(`  ${skips.categoryInvalid} catalog row(s) had category sanitized to NULL (unmapped value)`);
+      }
+      console.log(`  dedup divergence: Sheets=${divergence.sheetsCount}, PG=${divergence.pgCount}, S-only=${divergence.sheetsOnly}, P-only=${divergence.pgOnly}`);
+    } catch (e) {
+      console.error(`[${accountTab}] [pg-dry-run] diff build failed:`, e.message);
+      summary.pgDryRun = { account: accountTab, error: e.message };
+    }
+  }
+
+  console.log(`[${accountTab}] Done:`, JSON.stringify({ ...summary, pgDryRun: summary.pgDryRun ? "(see above)" : undefined }));
   return summary;
 }
 
@@ -774,11 +957,30 @@ async function main() {
 
   console.log(`Found ${accountTabs.length} account tabs: ${accountTabs.join(", ")}`);
 
+  // PR 8.3: PG dry-run context (only when CRON_USE_POSTGRES === "dry-run").
+  // Initialized once per cron run; reused for all per-account passes.
+  let pgCtx = null;
+  if (CRON_USE_POSTGRES === "dry-run") {
+    console.log(`\n[pg-dry-run] CRON_USE_POSTGRES=dry-run — PG reads + transforms enabled; NO PG writes will be performed`);
+    try {
+      const pgMod = await import("./pg-dry-run.mjs");
+      pgCtx = await pgMod.initPGDryRunContext({
+        supabaseUrl: SUPABASE_URL,
+        supabaseKey: SUPABASE_SERVICE_ROLE_KEY,
+      });
+      pgCtx.module = pgMod;
+      console.log(`[pg-dry-run] context ready: ${pgCtx.vendorMaps.nameToVendorId.size} vendor names + ${pgCtx.vendorMaps.aliasNormToVendorId.size} aliases loaded`);
+    } catch (e) {
+      console.error(`[pg-dry-run] initialization failed (cron continues without PG dry-run):`, e.message);
+      pgCtx = null;
+    }
+  }
+
   // Process each account
   const results = [];
   for (const tab of accountTabs) {
     try {
-      const result = await processAccount(tab);
+      const result = await processAccount(tab, pgCtx);
       results.push(result);
     } catch (e) {
       console.error(`[${tab}] Fatal error:`, e.message);
@@ -790,6 +992,16 @@ async function main() {
 
   // Post Slack digest
   await postSlackDigest(results);
+
+  // PR 8.3 dry-run: aggregate per-account diffs and post the dry-run digest
+  // separately from the (Monday-conditional) catalog digest. Runs every
+  // cron pass when CRON_USE_POSTGRES=dry-run.
+  if (pgCtx) {
+    const dryRunDiffs = results
+      .map((r) => r.pgDryRun)
+      .filter((d) => d != null);
+    await pgCtx.module.postPGDryRunDigest(SLACK_RECAP_WEBHOOK, dryRunDiffs);
+  }
 
   console.log("\n=== Cron Complete ===");
   const totalProcessed = results.reduce((s, r) => s + (r.processed || 0), 0);
