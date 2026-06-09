@@ -61,6 +61,25 @@ if (CRON_USE_POSTGRES === "dual-write" || CRON_USE_POSTGRES === "pg-only") {
   );
   process.exit(2);
 }
+// PR 3: catch-weight derivation mode (paired with intranet PR #133's prompt surgery).
+//   off    (default) - derivation never runs. Zero behavior change. Pre-Stage-A invariants hold.
+//   shadow           - derivation runs, tallies per-vendor would-recover / would-regress, writes
+//                      NOTHING live. Gate still runs on Claude's quantity (current behavior). Slack
+//                      digest reports bucket counts + auditable samples for spot-checking against
+//                      real invoices. This is the validation window before live cutover.
+//   live             - derived quantity REPLACES Claude's quantity at the gate AND for
+//                      price_history promotion. Cutover; flip after a clean shadow window
+//                      (would-regress sustained 0). Reversible by flipping env var back to shadow/off.
+const VALID_DERIVATION_MODES = new Set(["off", "shadow", "live"]);
+const CRON_USE_DERIVATION = (process.env.CRON_USE_DERIVATION || "off").trim();
+if (!VALID_DERIVATION_MODES.has(CRON_USE_DERIVATION)) {
+  console.error(
+    `[cron] Invalid CRON_USE_DERIVATION="${CRON_USE_DERIVATION}". ` +
+    `Valid: ${[...VALID_DERIVATION_MODES].join(" / ")}. Falling back to off.`
+  );
+}
+const DERIVATION_MODE = VALID_DERIVATION_MODES.has(CRON_USE_DERIVATION) ? CRON_USE_DERIVATION : "off";
+
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -165,6 +184,41 @@ function arithmeticCheck(li) {
   const ext = Number(li.extendedPrice) || 0;
   const tol = 0.02 * Math.abs(ext) + 0.01;
   return Math.abs(calc - ext) <= tol;
+}
+
+// ── Catch-weight derivation (PR 3) ──
+// Source of truth for the cron's catch-weight handling. Reads Stage A raw
+// fields off the line item (populated by intranet PR #133 into ai_line_items
+// Sheets cols P-X) and returns the quantity-for-pricing the gate + price
+// promotion should use.
+//
+// Detects STRUCTURALLY (weightLineValue present), NEVER by price magnitude.
+// NEVER back-computes from amount / unitPrice (the circular-gate bug that
+// failed the original Stage A held-out test). A null result is honest; it
+// routes the line to review_queue, NOT to a back-computed pass.
+//
+// MIRROR of scripts/_probe_stage_a_extraction.mjs's deriveLineItemQuantity
+// in the intranet repo (PR #133). If the two diverge, fix BOTH at the same
+// time so the held-out probe stays predictive of production behavior.
+//
+// Legacy pre-Stage-A rows have weightLineValue + shippedCount as empty
+// strings on the Sheets tab. parseFloat("") yields NaN; Number.isFinite
+// rejects NaN; both branches fall through to the honest_null_review
+// outcome. Callers in shadow mode treat this as "no derived value, leave
+// li.quantity alone for the gate"; callers in live mode would set
+// li.quantity = null which routes the line to review_queue. (In practice
+// legacy invoices never reach here because they're filtered out by the
+// processedInvoices dedup before the gate runs.)
+function deriveLineItemQuantity(li) {
+  const w = Number(li.weightLineValue);
+  if (Number.isFinite(w) && w > 0) {
+    return { quantity: w, unit: "lb", reason: "catch_weight_subline" };
+  }
+  const s = Number(li.shippedCount);
+  if (Number.isFinite(s) && s !== 0) {
+    return { quantity: s, unit: li.unit || "case", reason: "shipped_passthrough" };
+  }
+  return { quantity: null, unit: null, reason: "honest_null_review" };
 }
 
 // ── Claude API ──
@@ -320,6 +374,20 @@ async function processAccount(accountTab, pgCtx) {
     lineNum: r[6] || 0, description: r[7] || "", quantity: parseFloat(r[8]) || 0,
     unit: r[9] || "", unitPrice: parseFloat(r[10]) || 0, extendedPrice: parseFloat(r[11]) || 0,
     category: r[12] || "other",
+    // ── Stage A raw labeled fields (intranet PR #133) ──
+    // Sheets cols P-W (indices 15-22). Col X (raw_columns) is a backstop
+    // dump kept as a future hook and intentionally NOT read here.
+    // Empty strings on legacy pre-Stage-A rows; parseFloat("") yields NaN
+    // and deriveLineItemQuantity's Number.isFinite checks reject NaN, so
+    // legacy rows fall through to honest_null_review (no derivation effect).
+    itemNumber:        r[15] || null,
+    packSize:          r[16] || null,
+    orderedCount:      r[17] !== "" && r[17] != null ? parseFloat(r[17]) : null,
+    shippedCount:      r[18] !== "" && r[18] != null ? parseFloat(r[18]) : null,
+    uomRaw:            r[19] || null,
+    amount:            r[20] !== "" && r[20] != null ? parseFloat(r[20]) : null,
+    weightLineValue:   r[21] !== "" && r[21] != null ? parseFloat(r[21]) : null,
+    catchWeightMarker: r[22] || null,
   }));
 
   // 2. Read existing catalog + aliases + price_history + merge_history for this account
@@ -554,6 +622,21 @@ async function processAccount(accountTab, pgCtx) {
   const batchNewIds = {}; // index → generated itemId (for batch_match resolution)
   let matched = 0, created = 0, queued = 0, held = 0, skipped = 0;
 
+  // PR 3: catch-weight derivation shadow tally. Only populated when
+  // DERIVATION_MODE !== "off". Buckets per the held-out probe + PR 3 spec:
+  //   wouldRecover - currentGate FAIL, derivedGate PASS (the win)
+  //   wouldRegress - currentGate PASS, derivedGate FAIL or HELD (the alarm; must stay 0)
+  //   noChange     - currentGate PASS, derivedGate PASS
+  //   residual     - currentGate FAIL, derivedGate FAIL or HELD (review-queue floor)
+  // Samples capture vendor / invoice# / desc / old qty / new qty + reason
+  // so Kevin can pull the invoice and spot-check that the recovered quantity
+  // is genuinely correct, not just arithmetically footing.
+  const derivationTally = { wouldRecover: 0, wouldRegress: 0, noChange: 0, residual: 0 };
+  const derivationByVendor = new Map();
+  const wouldRecoverSamples = [];
+  const wouldRegressSamples = [];
+  const SAMPLE_LIMIT_PER_ACCOUNT = 5;
+
   for (const r of results) {
     const li = newItems[r.index];
     if (!li) continue;
@@ -573,6 +656,84 @@ async function processAccount(accountTab, pgCtx) {
       (r.action === "match" && r.matchedItemId && r.confidence >= MATCH_CONFIDENCE_THRESHOLD) ||
       (r.action === "new" && !(r.confidence !== undefined && r.confidence >= 60)) ||
       (r.action === "batch_match");
+
+    // PR 3: catch-weight derivation. Scope intentionally limited to wouldPromote
+    // lines, same scope as the gate. Off / shadow / live modes:
+    //   off    - no-op; current behavior preserved exactly.
+    //   shadow - compute derived, run the gate on both Claude's and derived
+    //            quantities, tally per-vendor, collect samples for spot-checking.
+    //            Does NOT mutate li.
+    //   live   - mutate li.quantity + li.unit to derived values BEFORE the gate
+    //            runs, so the gate + downstream price_history use the derived
+    //            quantity. Honest-null becomes li.quantity = null and the gate
+    //            then fails so the line routes to review_queue.
+    if (wouldPromote && DERIVATION_MODE !== "off") {
+      const derived = deriveLineItemQuantity(li);
+
+      if (DERIVATION_MODE === "shadow") {
+        const currentPass = arithmeticCheck(li);
+        let derivedPass;
+        let derivedGateLabel;
+        if (derived.quantity == null) {
+          derivedPass = false;
+          derivedGateLabel = "HELD";
+        } else {
+          derivedPass = arithmeticCheck({ ...li, quantity: derived.quantity });
+          derivedGateLabel = derivedPass ? "PASS" : "FAIL";
+        }
+
+        let bucket;
+        if (!currentPass && derivedPass) bucket = "wouldRecover";
+        else if (currentPass && !derivedPass) bucket = "wouldRegress";
+        else if (currentPass && derivedPass) bucket = "noChange";
+        else bucket = "residual";
+
+        derivationTally[bucket]++;
+        const v = li.vendor || "(no vendor)";
+        if (!derivationByVendor.has(v)) {
+          derivationByVendor.set(v, { wouldRecover: 0, wouldRegress: 0, noChange: 0, residual: 0 });
+        }
+        derivationByVendor.get(v)[bucket]++;
+
+        // Sample collection: capped per account so a single noisy account
+        // can't drown the digest. Top-level aggregator slices to the global
+        // sample budget downstream (see buildDerivationShadowSection).
+        if (bucket === "wouldRecover" && wouldRecoverSamples.length < SAMPLE_LIMIT_PER_ACCOUNT) {
+          wouldRecoverSamples.push({
+            account: accountTab,
+            vendor: li.vendor, invoiceNumber: li.invoiceNumber, description: li.description,
+            oldQty: li.quantity, oldUnit: li.unit,
+            newQty: derived.quantity, newUnit: derived.unit,
+            unitPrice: li.unitPrice, amount: li.extendedPrice,
+            derivedReason: derived.reason,
+          });
+        }
+        if (bucket === "wouldRegress" && wouldRegressSamples.length < SAMPLE_LIMIT_PER_ACCOUNT) {
+          wouldRegressSamples.push({
+            account: accountTab,
+            vendor: li.vendor, invoiceNumber: li.invoiceNumber, description: li.description,
+            oldQty: li.quantity, oldUnit: li.unit,
+            newQty: derived.quantity, newUnit: derived.unit,
+            unitPrice: li.unitPrice, amount: li.extendedPrice,
+            derivedGateResult: derivedGateLabel, derivedReason: derived.reason,
+          });
+        }
+      } else if (DERIVATION_MODE === "live") {
+        // Replace li's quantity-for-pricing with the derived value. Both
+        // the gate (below) and the downstream price_history writer use
+        // li.quantity, so this single mutation drives both.
+        if (derived.quantity != null) {
+          li.quantity = derived.quantity;
+          li.unit = derived.unit;
+        } else {
+          // Honest null sets quantity to null so the gate fails and the
+          // line routes to review_queue rather than silently promoting a
+          // back-computed value.
+          li.quantity = null;
+        }
+      }
+    }
+
     if (wouldPromote && !arithmeticCheck(li)) {
       held++;
       newQueueRows.push(shapes.makeQueueRow({
@@ -788,6 +949,28 @@ async function processAccount(accountTab, pgCtx) {
 
   const summary = { account: accountTab, processed: newItems.length, matched, created, queued, held, skipped, invoiceHoldsHonored, linesDeferredByHold, creditsSkipped, linesSkippedByCredit };
 
+  // PR 3: attach the shadow tally + samples to the per-account summary so
+  // main()'s digest aggregator can roll them up. Only present in shadow
+  // mode (live + off skip the bucket math).
+  if (DERIVATION_MODE === "shadow") {
+    summary.derivationShadow = {
+      tally: derivationTally,
+      byVendor: Object.fromEntries(derivationByVendor),
+      wouldRecoverSamples,
+      wouldRegressSamples,
+    };
+    // Also log the per-account summary line for Railway log grep. Lets Kevin
+    // pull the full sample set from logs even if Slack message gets clipped.
+    const t = derivationTally;
+    console.log(`[${accountTab}] [derivation-shadow] would-recover=${t.wouldRecover}, would-regress=${t.wouldRegress}, no-change=${t.noChange}, residual=${t.residual}`);
+    for (const s of wouldRecoverSamples) {
+      console.log(`[${accountTab}] [derivation-shadow-sample-recover] ${JSON.stringify(s)}`);
+    }
+    for (const s of wouldRegressSamples) {
+      console.log(`[${accountTab}] [derivation-shadow-sample-regress] ${JSON.stringify(s)}`);
+    }
+  }
+
   // PR 8.3 dry-run: transform the Sheets row arrays into PG row shape,
   // compute the dedup divergence, attach the per-account diff to the
   // summary so main() can post the aggregate digest. Writes NOTHING to PG.
@@ -835,6 +1018,84 @@ async function processAccount(accountTab, pgCtx) {
   return summary;
 }
 
+// ── PR 3: Slack section for the catch-weight derivation shadow ──
+// Aggregates per-account shadow tallies, sorts the per-vendor would-recover
+// breakdown by recovery count, and pastes auditable samples for spot-checking
+// against the actual invoices (Kevin's "verify the recovered quantity is
+// genuinely correct, not just arithmetically footing" requirement).
+//
+// Sample budget: up to GLOBAL_SAMPLE_CAP per bucket in Slack. Full per-account
+// samples are also written to console.log via processAccount so Railway log
+// grep can pull the unbounded set if Slack clips. Returns empty string when
+// shadow data is absent (off / live).
+function buildDerivationShadowSection(results) {
+  const shadowResults = results.filter((r) => r.derivationShadow);
+  if (shadowResults.length === 0) return "";
+
+  const GLOBAL_SAMPLE_CAP = 15;
+  const total = { wouldRecover: 0, wouldRegress: 0, noChange: 0, residual: 0 };
+  const byVendor = new Map();
+  let allRecover = [];
+  let allRegress = [];
+  for (const r of shadowResults) {
+    const s = r.derivationShadow;
+    for (const k of ["wouldRecover", "wouldRegress", "noChange", "residual"]) total[k] += s.tally[k];
+    for (const [v, t] of Object.entries(s.byVendor)) {
+      if (!byVendor.has(v)) byVendor.set(v, { wouldRecover: 0, wouldRegress: 0, noChange: 0, residual: 0 });
+      const b = byVendor.get(v);
+      for (const k of ["wouldRecover", "wouldRegress", "noChange", "residual"]) b[k] += t[k];
+    }
+    allRecover = allRecover.concat(s.wouldRecoverSamples);
+    allRegress = allRegress.concat(s.wouldRegressSamples);
+  }
+
+  let text = `\n*🧪 Catch-weight derivation shadow* (CRON_USE_DERIVATION=shadow)\n`;
+  text += `   would-recover: ${total.wouldRecover} line(s)`;
+  if (total.wouldRecover > 0) {
+    const vendorList = [...byVendor.entries()]
+      .filter(([_v, t]) => t.wouldRecover > 0)
+      .sort((a, b) => b[1].wouldRecover - a[1].wouldRecover);
+    text += ` across ${vendorList.length} vendor(s):\n`;
+    for (const [v, t] of vendorList) text += `      ${v}: ${t.wouldRecover}\n`;
+  } else {
+    text += `\n`;
+  }
+  text += `   would-regress: ${total.wouldRegress} line(s) ${total.wouldRegress > 0 ? "⚠️ ALARM, investigate before live cutover" : ""}\n`;
+  text += `   no-change: ${total.noChange} line(s)\n`;
+  text += `   residual (still FAIL after derivation): ${total.residual} line(s) ← review-queue floor\n`;
+
+  if (allRecover.length > 0) {
+    text += `\n   *Would-recover samples (verify against invoices):*\n`;
+    const samples = allRecover.slice(0, GLOBAL_SAMPLE_CAP);
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      const desc = String(s.description || "").slice(0, 40);
+      const recompute = (Number(s.newQty) * Number(s.unitPrice)).toFixed(2);
+      text += `   ${i + 1}. \`${s.vendor || "?"}\` #${s.invoiceNumber || "?"} "${desc}"\n`;
+      text += `      old qty=${s.oldQty} ${s.oldUnit || ""} -> new qty=${s.newQty} ${s.newUnit || ""} (${s.derivedReason})\n`;
+      text += `      unitPrice=$${s.unitPrice}, amount=$${s.amount}, ${s.newQty}×${s.unitPrice}=${recompute}\n`;
+    }
+    if (allRecover.length > GLOBAL_SAMPLE_CAP) {
+      text += `   (+${allRecover.length - GLOBAL_SAMPLE_CAP} more samples in Railway logs: grep "derivation-shadow-sample-recover")\n`;
+    }
+  }
+  if (allRegress.length > 0) {
+    text += `\n   *Would-regress samples* ⚠️ *(alarm, investigate):*\n`;
+    const samples = allRegress.slice(0, GLOBAL_SAMPLE_CAP);
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      const desc = String(s.description || "").slice(0, 40);
+      text += `   ${i + 1}. \`${s.vendor || "?"}\` #${s.invoiceNumber || "?"} "${desc}"\n`;
+      text += `      old qty=${s.oldQty} (gate PASS) -> new qty=${s.newQty}/${s.derivedGateResult} (${s.derivedReason})\n`;
+      text += `      unitPrice=$${s.unitPrice}, amount=$${s.amount}\n`;
+    }
+    if (allRegress.length > GLOBAL_SAMPLE_CAP) {
+      text += `   (+${allRegress.length - GLOBAL_SAMPLE_CAP} more regression samples in Railway logs: grep "derivation-shadow-sample-regress")\n`;
+    }
+  }
+  return text;
+}
+
 // ── Slack Digest (Mondays) ──
 async function postSlackDigest(results) {
   if (!SLACK_RECAP_WEBHOOK) return;
@@ -877,6 +1138,10 @@ async function postSlackDigest(results) {
   if (totalCredits > 0) {
     text += `*🧾 ${totalCredits} credit memo(s) skipped (${totalLinesByCredit} line(s)) — extracted to ai_line_items for finance, not fed to inventory*\n`;
   }
+
+  // PR 3: catch-weight derivation shadow section (fires only when shadow data
+  // is attached to per-account results, i.e. CRON_USE_DERIVATION=shadow).
+  text += buildDerivationShadowSection(results);
 
   if (isMonday) {
     text += "\n*📋 Weekly Catalog Health:*\n";
@@ -1022,6 +1287,12 @@ async function main() {
   const accountTabs = allTabs.filter((t) => !skipTabs.has(t) && !t.startsWith("_"));
 
   console.log(`Found ${accountTabs.length} account tabs: ${accountTabs.join(", ")}`);
+
+  // PR 3: log the active derivation mode so Railway logs show which path
+  // the cron took without needing the env var page.
+  if (DERIVATION_MODE !== "off") {
+    console.log(`\n[derivation] CRON_USE_DERIVATION=${DERIVATION_MODE}: catch-weight derivation active (${DERIVATION_MODE === "shadow" ? "tallies only, NO live behavior change" : "LIVE: gate + price_history use derived quantity"})`);
+  }
 
   // PR 8.3: PG dry-run context (only when CRON_USE_POSTGRES === "dry-run").
   // Initialized once per cron run; reused for all per-account passes.
