@@ -65,6 +65,34 @@ capability rather than N profiles.
 - `Weights: TOTAL= ##.## ==>>>>` (Kuna)
 - printed WEIGHT column where weight × unitPrice ≈ amount (Cheney catch-weight lines)
 
+### Marker proof status (updated as we validate)
+
+The prompt asks Claude to capture all markers above, but they have different
+levels of empirical validation. PR 1's held-out probe validated extraction +
+derivation + gate-pass on a subset; the rest are expected to work by symmetry
+and get verified at scale by the shadow run (PR 3) or by future targeted
+probes. Honest about what's proven; honest about what's not.
+
+**PROVEN (validated in PR 1's held-out probe against real invoices):**
+- `Total Weight ##.##` / `Weight: ##.##` sub-line (Ben E Keith) - verified on BEK Beef Chuck (`weightLineValue=103`), plus bonus Pork Belly (28.95#), Beef Flank Steak (83.10#), Beef Ribeye (44.85#), Beef Tenderloin (14.75#), Beef Tri-Tip (16.17#), Beef Flat Iron (22.60#), Chicken Thigh (20.88#). Every catch-weight line on BEK F3 invoices recovers via `catch_weight_subline` derivation. Legacy claude-qty gate FAILed every one; derived gate PASSes every one.
+- `TOTAL WEIGHT: ##.###` and per-case `CASE: WEIGHT: ##.###` (Gordon Food Service) - verified on Beef Flank (`weightLineValue=35.500`, 35.5 × 9.55 = 339.03 ✓) and Beef Grnd 80/10 (`weightLineValue=76.900`, 76.9 × 6.53 = 502.16 ✓).
+- Weight-in-SHIPPED-column form (What Chefs Want, on lines that do NOT have a "Case weights" sub-line) - verified on WCW Grouper (`shippedCount=14.6`, `unit=lb`, 14.6 × 30.24 = 441.50 ✓). Goes through `shipped_passthrough`, not `catch_weight_subline`, but produces the correct LB result. NEW FINDING: WCW has BOTH catch-weight presentations - some lines use the sub-line, some put the weight directly in the SHIPPED column. The derivation handles both.
+
+**UNPROVEN (in the prompt but not yet validated against a real invoice):**
+- `Case weights: X.XX, ..., TOTAL: Y.YY` sub-line form (What Chefs Want) - this is the variant the census rationales described, but the WCW test invoice in PR 1's probe didn't have it. Validated at scale by the shadow run when WCW lines that currently fail the gate get rescued (or don't) via `catch_weight_subline`.
+- `T/WT= ##.###` (Sysco) - not yet exercised by a probe. Shadow run will surface Sysco recovery counts.
+- `Weights: TOTAL= ##.## ==>>>>` (Kuna) - not yet exercised. Shadow run will surface Kuna recovery counts (and likely also the F5 image-quality residue for blurry scans).
+- Printed WEIGHT column on Cheney F4 catch-weight lines (where the prompt asks Claude to put the weight value in `weightLineValue`) - the PR 1 probe found Claude tends to put the weight in `shippedCount` instead on Cheney lines, which still produces the correct LB result via `shipped_passthrough` but does NOT exercise `catch_weight_subline`. Whether this is good-enough or whether we need to tighten the prompt for Cheney is a question the shadow run will answer.
+
+**Honest-null principle - PROVEN as a universal load-bearing assertion:**
+PR 1's probe ran the honest-null principle check on every line of every test
+invoice (50+ lines across BEK, WCW, Gordon, Cheney, Kuna, Peddler's, Fortune
+Fish). 20/20 honest-null candidates correctly returned `derivedQty=null` and
+gate=HELD - none were back-computed, none silently passed. This is the
+load-bearing assertion that distinguishes "honest null routed to review" from
+"failed the gate" and is what protects against the Stage A circular-gate
+bug class. The principle is universal across families and verified at scale.
+
 ### Refined build order (by volume × failure, with the catch-weight reframe)
 
 1. **Shared catch-weight sub-line extractor** - FIRST. Fixes WCW (22, biggest vendor), Gordon (5),
