@@ -26,6 +26,14 @@ const shapes = require("./row-shapes.js");
 const INVENTORY_SHEET_ID = process.env.INVENTORY_SHEET_ID;
 const AI_LINE_ITEMS_SHEET_ID = process.env.AI_LINE_ITEMS_SHEET_ID;
 const HUB_SHEET_ID = process.env.HUB_SHEET_ID;
+// Stage 0 (credit filter): optional. When set, the cron reads
+// invoice_submissions_26 from the COLLECTION spreadsheet to find rows
+// tagged type='credit' (col P / index 15) and filters their line items
+// out of the Claude matching pass. Credits are still extracted + stored
+// in ai_line_items for finance; they're only excluded from inventory
+// ingestion. If COLLECTION_SHEET_ID is unset, the cron falls back to
+// today's behavior (no credit filter) with a single startup warning.
+const COLLECTION_SHEET_ID = process.env.COLLECTION_SHEET_ID;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const MATCH_CONFIDENCE_THRESHOLD = parseInt(process.env.MATCH_CONFIDENCE_THRESHOLD || "90");
 const SLACK_RECAP_WEBHOOK = process.env.SLACK_RECAP_WEBHOOK;
@@ -315,11 +323,16 @@ async function processAccount(accountTab, pgCtx) {
   }));
 
   // 2. Read existing catalog + aliases + price_history + merge_history for this account
-  const [catalogRows, aliasRows, priceRows, mergeRows] = await Promise.all([
+  const [catalogRows, aliasRows, priceRows, mergeRows, invoiceSubmissionRows] = await Promise.all([
     readTab(INVENTORY_SHEET_ID, "item_catalog"),
     readTab(INVENTORY_SHEET_ID, "item_aliases"),
     readTab(INVENTORY_SHEET_ID, "price_history"),
     readTab(INVENTORY_SHEET_ID, "merge_history"),
+    // Stage 0 (credit filter): read invoice_submissions_26 to identify
+    // credit memos so their line items can be skipped from inventory
+    // ingestion. Returns [] when COLLECTION_SHEET_ID is unset (the
+    // filter then no-ops at the filter block below).
+    COLLECTION_SHEET_ID ? readTab(COLLECTION_SHEET_ID, "invoice_submissions_26") : Promise.resolve([]),
   ]);
 
   // Use accountMatch for flexible matching (short label vs full label)
@@ -400,6 +413,47 @@ async function processAccount(accountTab, pgCtx) {
     linesDeferredByHold = wasCount - newItems.length;
     if (linesDeferredByHold > 0) {
       console.log(`[${accountTab}] honored invoice-level holds: ${invoiceHoldsHonored} invoice(s), ${linesDeferredByHold} line(s) deferred (reason=overcount_suspect_reextract)`);
+    }
+  }
+
+  // ── Credit filter (Stage 0) ──
+  // invoice_submissions rows with type='credit' represent credit memos.
+  // They're real financial records (already extracted and stored in
+  // ai_line_items for accounting), but their line items must NOT feed
+  // inventory pricing or catalog. Filter them out at the same pre-Claude
+  // gate as overcount holds.
+  //
+  // Source: invoice_submissions_26 in the COLLECTION spreadsheet.
+  // Columns (per src/lib/dataStore/invoice.js SUB_IDX):
+  //   col 0  (A) = uuid (client_uuid; matches ai_line_items.invoiceUuid)
+  //   col 3  (D) = account
+  //   col 15 (P) = type ('invoice' | 'credit', default 'invoice')
+  //
+  // No-op when COLLECTION_SHEET_ID is unset (invoiceSubmissionRows = []).
+  let creditsSkipped = 0, linesSkippedByCredit = 0;
+  {
+    const creditUuids = new Set();
+    for (const r of invoiceSubmissionRows || []) {
+      if (String(r[15] || "").trim() === "credit" && accountMatch(r[3], accountTab)) {
+        const u = String(r[0] || "").trim();
+        if (u) creditUuids.add(u);
+      }
+    }
+    if (creditUuids.size > 0) {
+      const wasCount = newItems.length;
+      const skippedSet = new Set();
+      newItems = newItems.filter((li) => {
+        if (creditUuids.has(li.invoiceUuid)) {
+          skippedSet.add(li.invoiceUuid);
+          return false;
+        }
+        return true;
+      });
+      creditsSkipped = skippedSet.size;
+      linesSkippedByCredit = wasCount - newItems.length;
+      if (linesSkippedByCredit > 0) {
+        console.log(`[${accountTab}] credit memos skipped: ${creditsSkipped} invoice(s), ${linesSkippedByCredit} line(s) deferred (type=credit on invoice_submissions)`);
+      }
     }
   }
 
@@ -732,7 +786,7 @@ async function processAccount(accountTab, pgCtx) {
   if (newPriceRows.length) await appendRows(INVENTORY_SHEET_ID, "price_history!A1", newPriceRows);
   if (newQueueRows.length) await appendRows(INVENTORY_SHEET_ID, "review_queue!A1", newQueueRows);
 
-  const summary = { account: accountTab, processed: newItems.length, matched, created, queued, held, skipped, invoiceHoldsHonored, linesDeferredByHold };
+  const summary = { account: accountTab, processed: newItems.length, matched, created, queued, held, skipped, invoiceHoldsHonored, linesDeferredByHold, creditsSkipped, linesSkippedByCredit };
 
   // PR 8.3 dry-run: transform the Sheets row arrays into PG row shape,
   // compute the dedup divergence, attach the per-account diff to the
@@ -798,16 +852,20 @@ async function postSlackDigest(results) {
   let text = "*🔄 Inventory Cron — Nightly Run*\n";
   let totalHeld = 0;
   let totalInvoiceHolds = 0, totalLinesDeferred = 0;
+  let totalCredits = 0, totalLinesByCredit = 0;
   for (const r of results) {
-    if (r.processed > 0 || r.error || r.linesDeferredByHold) {
+    if (r.processed > 0 || r.error || r.linesDeferredByHold || r.linesSkippedByCredit) {
       const heldPart = r.held ? `, ${r.held} held` : "";
       const deferredPart = r.linesDeferredByHold ? `, ${r.linesDeferredByHold} deferred (${r.invoiceHoldsHonored} held invoice${r.invoiceHoldsHonored === 1 ? "" : "s"})` : "";
-      text += `• *${r.account}*: ${r.matched} matched, ${r.created} new, ${r.queued} queued${heldPart}${deferredPart}, ${r.skipped} skipped`;
+      const creditPart = r.linesSkippedByCredit ? `, ${r.linesSkippedByCredit} credit-skipped (${r.creditsSkipped} credit memo${r.creditsSkipped === 1 ? "" : "s"})` : "";
+      text += `• *${r.account}*: ${r.matched} matched, ${r.created} new, ${r.queued} queued${heldPart}${deferredPart}${creditPart}, ${r.skipped} skipped`;
       if (r.error) text += ` ⚠️ ${r.error}`;
       text += "\n";
       totalHeld += r.held || 0;
       totalInvoiceHolds += r.invoiceHoldsHonored || 0;
       totalLinesDeferred += r.linesDeferredByHold || 0;
+      totalCredits += r.creditsSkipped || 0;
+      totalLinesByCredit += r.linesSkippedByCredit || 0;
     }
   }
   if (totalHeld > 0) {
@@ -815,6 +873,9 @@ async function postSlackDigest(results) {
   }
   if (totalInvoiceHolds > 0) {
     text += `*⏸ ${totalInvoiceHolds} invoice(s) deferred entirely (${totalLinesDeferred} line(s)) by overcount_suspect_reextract flag*\n`;
+  }
+  if (totalCredits > 0) {
+    text += `*🧾 ${totalCredits} credit memo(s) skipped (${totalLinesByCredit} line(s)) — extracted to ai_line_items for finance, not fed to inventory*\n`;
   }
 
   if (isMonday) {
@@ -947,6 +1008,11 @@ async function main() {
   if (!INVENTORY_SHEET_ID || !AI_LINE_ITEMS_SHEET_ID || !ANTHROPIC_API_KEY) {
     console.error("Missing required env vars. Need: INVENTORY_SHEET_ID, AI_LINE_ITEMS_SHEET_ID, ANTHROPIC_API_KEY");
     process.exit(1);
+  }
+  if (!COLLECTION_SHEET_ID) {
+    // Stage 0 credit filter requires COLLECTION_SHEET_ID. Warn once at startup
+    // and continue without the filter (pre-Stage-0 behavior preserved).
+    console.warn("[Stage 0] COLLECTION_SHEET_ID not set — credit filter disabled, all invoices (including type='credit') will be ingested into inventory as before.");
   }
 
   // Discover account tabs in AI_LINE_ITEMS
