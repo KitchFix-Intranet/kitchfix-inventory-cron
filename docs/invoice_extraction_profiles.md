@@ -407,3 +407,34 @@ genuinely can't recover.
   two angles: extraction sees them as "unrecoverable lines"; compliance sees them as "operator
   uploaded a bad scan." Both pipelines should surface the same uuids so the operator gets a
   single coherent signal, not two contradictory ones.
+- Duplicate `invoice_submissions` dedup plan (APPROVED IN PRINCIPLE, NOT YET BUILT). Recon found
+  27 duplicate groups across 800 submissions (3.5%): operators submit the same invoice multiple
+  times, creating multiple invoiceUuids each with their own ai_line_items rows. Sampled 4 accounts
+  showed ~11 groups with TRUE duplicate ingestion (all uuids present in ai_line_items); worst case
+  was Sysco #103349834 with 3 submissions x 43 lines = 129 line items for one invoice. The RAW +
+  processed Drive folder pair (711 paired files from the corpus census) is a DRIVE-side storage
+  artifact, NOT a duplicate ingestion - each submission stores both copies but is still one
+  ingestion. The duplicate-ingestion issue is at the submission-pipeline level.
+  CRITICAL grouping detail: must group on `(account_key, vendor_id, invoice_number, type)` NOT
+  just `(account, vendor, invoice_number)`. The invoice + credit memo pair often share the same
+  invoice number (legitimately - the credit references the invoice it credits). Caught in recon
+  via Shamrock #36598788 (CIN-AZ) where an invoice + credit pair had matching numbers; grouping
+  without the type guard would have corrupted both records on dedup.
+  Phased plan (sequenced AFTER the upload-compliance report; joint-design candidate):
+    Phase A: forward-fix at submission time. Check `invoice_submissions` for an existing row
+      matching (account_key, vendor_id, invoice_number, type) within the last 30 days where
+      status is not in ('corrected','returned','deleted'); if found, prompt the operator
+      ("Looks like you already submitted this on {date}. Continue anyway?"). This is
+      COMPLIANCE-ADJACENT (catches bad operator upload behavior at submission time), same
+      domain as the upload-compliance report. The two should share design where possible so
+      we don't build one in ignorance of the other.
+    Phase B: canonicalize existing duplicates via a `superseded_by_uuid` column (or status
+      value like 'superseded-by-{uuid}'). Pick canonical by status='sent' > 'photo-only' >
+      most-recent-submittedAt. Flag the non-canonical ai_line_items rows with a `superseded`
+      flag (new column, additive migration). The cron's processedInvoices dedup gets a small
+      change: also skip superseded=true rows.
+    Phase C: decide deletion vs retention later, after Phase B has stabilized for 1-2 weeks.
+      Default recommendation: retain flagged for audit, do not delete.
+  Not a fire: ~50-200 duplicate rows org-wide, EXTRA rows not MISSING data. Catalog accuracy
+  impact is real but bounded. Recon probe is at `scripts/_probe_duplicate_invoices.mjs` in the
+  intranet repo (untracked).
