@@ -511,6 +511,59 @@ async function processAccount(accountTab, pgCtx) {
       if (inv) heldInvoiceUuids.add(inv);
     }
   }
+
+  // ── Invoice-level verification override ──
+  // Reads the invoice_verifications tab (written by the Review Queue dashboard's
+  // "Mark verified" button in intranet PR B). Each row records that an operator
+  // has manually reviewed an invoice flagged as overcount_suspect_reextract and
+  // confirmed the extraction is faithful. The verification RELEASES the
+  // invoice-level hold only - per-line gates (arithmeticCheck, match confidence)
+  // still apply, so genuinely bad lines reappear as normal arithmetic_fail /
+  // match rows. Verification means "the extraction is faithful," not "trust all
+  // math."
+  //
+  // Tab schema (header at row 1):
+  //   col A (0) verificationId    "ver_<uid>"
+  //   col B (1) invoiceUuid       maps to invoice_submissions.id
+  //   col C (2) account           filtered against accountTab via accountMatch
+  //   col D (3) verifiedAt        ISO timestamp
+  //   col E (4) verifiedBy        operator email
+  //   col F (5) note              optional free-text
+  //
+  // Deploy ordering: this cron edit ships first as a no-op (tab does not yet
+  // exist; try/catch defaults verifiedInvoiceUuids to empty, subtraction is a
+  // no-op, behavior identical to pre-edit). Intranet PR B then adds the write
+  // path. Verifications written before this code lands would be harmless dead
+  // data the cron ignores.
+  //
+  // Account safety: both heldInvoiceUuids and verifiedInvoiceUuids are scoped
+  // to the current accountTab via accountMatch (rows for other accounts never
+  // enter either set). Cross-account release is structurally impossible - an
+  // account-A verification fails accountMatch against accountTab=B on all three
+  // conditions (exact, prefix-down, prefix-up), so it is not in the set when
+  // B's holds are processed.
+  const verifiedInvoiceUuids = new Set();
+  try {
+    const verRows = await readTab(INVENTORY_SHEET_ID, "invoice_verifications");
+    for (const v of verRows) {
+      if (accountMatch(v[2], accountTab)) {
+        const u = String(v[1] || "").trim();
+        if (u) verifiedInvoiceUuids.add(u);
+      }
+    }
+  } catch (e) {
+    // Tab missing or unreadable - default to no verifications (pre-PR behavior).
+    console.log(`[${accountTab}] invoice_verifications tab not read (${e.message}); defaulting to none`);
+  }
+
+  let releasedByVerification = 0;
+  for (const u of verifiedInvoiceUuids) {
+    if (heldInvoiceUuids.delete(u)) releasedByVerification++;
+  }
+  if (releasedByVerification > 0) {
+    console.log(`[${accountTab}] invoice_verifications released ${releasedByVerification} hold(s)`);
+  }
+
   let invoiceHoldsHonored = 0, linesDeferredByHold = 0;
   if (heldInvoiceUuids.size > 0) {
     const wasCount = newItems.length;
