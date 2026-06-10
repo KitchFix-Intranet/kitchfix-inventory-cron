@@ -791,12 +791,18 @@ async function complianceReport() {
   const since  = new Date(Date.now() - COMPLIANCE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString();
   const cutoff = new Date(Date.now() - GAP_MIN_AGE_HOURS         *      60 * 60 * 1000).toISOString();
 
+  // v2: also pull raw_drive_url + drive_urls so the Slack section can
+  // wrap each flagged invoice as a one-click Drive link. Precedent: the
+  // intranet's InvoiceAdmin already uses these as direct <a target=_blank>
+  // links (rawDriveUrl is the unstamped scan, the leader's actual upload).
+  const COMPLIANCE_SELECT = "id, account_key, vendor_id, invoice_number, submitted_at, type, status, ai_scan_status, raw_drive_url, drive_urls";
+
   // FAILED (ai_scan_status='failed'). No type/status guard here: a failed
   // scan is a definitive bad-upload signal regardless of how the workflow
   // subsequently labeled the submission.
   const { data: failed, error: fE } = await supa
     .from("invoice_submissions")
-    .select("id, account_key, vendor_id, invoice_number, submitted_at, type, status, ai_scan_status")
+    .select(COMPLIANCE_SELECT)
     .eq("ai_scan_status", "failed")
     .eq("is_historical", false)
     .gte("submitted_at", since)
@@ -808,7 +814,7 @@ async function complianceReport() {
   // line-item lookup matches check2's pattern.
   const { data: candidates, error: cE } = await supa
     .from("invoice_submissions")
-    .select("id, account_key, vendor_id, invoice_number, submitted_at, type, status, ai_scan_status")
+    .select(COMPLIANCE_SELECT)
     .eq("ai_scan_complete", true)
     .eq("is_historical", false)
     .gte("submitted_at", since)
@@ -851,19 +857,49 @@ async function complianceReport() {
   };
 }
 
-// Format the compliance section as Slack-mrkdwn lines. Returns an array of
-// strings (caller joins). Returns [] if nothing to report so the caller can
-// no-op cleanly.
-function buildComplianceSection(report) {
-  if (!report) return [];
+// Resolve the best one-click link for an invoice_submissions row. Mirrors the
+// intranet InvoiceAdmin convention: rawDriveUrl is the unstamped scan (the
+// leader's actual upload, what Kevin wants to screenshot/forward); fall back
+// to the first stamped page URL when rawDriveUrl is missing on legacy rows.
+// Returns null when neither exists -- the caller renders plain text in that
+// case (no broken link).
+function complianceLinkFor(row) {
+  if (row.raw_drive_url && String(row.raw_drive_url).trim()) {
+    return String(row.raw_drive_url).trim();
+  }
+  // PG stores drive_urls as JSONB (array of strings). Handle array AND
+  // legacy JSON-string shapes defensively.
+  let urls = row.drive_urls;
+  if (typeof urls === "string") {
+    try { urls = JSON.parse(urls); } catch { urls = []; }
+  }
+  if (Array.isArray(urls) && urls.length > 0) {
+    const first = typeof urls[0] === "string" ? urls[0] : urls[0]?.url;
+    if (first && String(first).trim()) return String(first).trim();
+  }
+  return null;
+}
+
+// Build the standalone Compliance v2 Slack message. Returns { text, mrkdwn }
+// for postSlack, or null when there's nothing to post (caller skips the post).
+// Posted SEPARATELY from the alarm digest so Kevin can forward it to account
+// leaders without the engineering noise.
+//
+// Each flagged invoice's vendor+invoice# is wrapped as a clickable Drive link
+// (Slack <url|display> mrkdwn) when raw_drive_url or drive_urls[0] is present.
+// Plain text when both are missing (very old rows) -- no broken link.
+function buildComplianceMessage(report) {
+  if (!report) return null;
   const total = report.failed.length + report.empty.length;
-  const lines = [];
 
   if (total === 0) {
-    lines.push(`*📤 Invoice Upload Quality - last ${report.lookback}d*`);
-    lines.push(`   ✓ Clean. 0 bad uploads in window.`);
-    lines.push("");
-    return lines;
+    return {
+      text: `Invoice Upload Quality: clean (last ${report.lookback}d)`,
+      mrkdwn: [
+        `*📤 Invoice Upload Quality* (last ${report.lookback}d)`,
+        `   ✓ Clean. 0 bad uploads in window.`,
+      ].join("\n"),
+    };
   }
 
   // Per-account summary, sorted by total bad uploads (outliers float to top).
@@ -882,8 +918,9 @@ function buildComplianceSection(report) {
     (b[1].failed + b[1].empty) - (a[1].failed + a[1].empty)
   );
 
-  lines.push(`*📤 Invoice Upload Quality - last ${report.lookback}d*`);
-  lines.push(`   Total bad uploads: ${total} across ${byAcct.size} account(s)`);
+  const lines = [];
+  lines.push(`*📤 Invoice Upload Quality* (last ${report.lookback}d)`);
+  lines.push(`Total bad uploads: ${total} across ${byAcct.size} account(s)`);
   lines.push("");
   for (const [a, c] of ranked) {
     const bits = [];
@@ -894,17 +931,23 @@ function buildComplianceSection(report) {
   lines.push("");
 
   // Per-invoice detail, most recent first, mixed FAILED + EMPTY. Capped at
-  // 25 in Slack; full set lands in console.log for Railway grep.
+  // 25 in Slack; full unbounded set lands in console.log for Railway grep.
   const all = [
     ...report.failed.map((r) => ({ ...r, reason: "FAILED" })),
     ...report.empty.map((r) => ({ ...r, reason: "EMPTY" })),
   ].sort((a, b) => (b.submitted_at || "").localeCompare(a.submitted_at || ""));
 
-  lines.push(`   *Per invoice (most recent first):*`);
+  lines.push(`*Per invoice (most recent first):*`);
   for (const r of all.slice(0, 25)) {
-    const ts = (r.submitted_at || "").slice(0, 10);
+    const ts   = (r.submitted_at || "").slice(0, 10);
     const acct = (r.account_key || "?").padEnd(14);
-    lines.push(`   • ${acct} \`${r.reason}\` ${r.vendor_id || "?"} #${r.invoice_number || "?"} (${ts})`);
+    const label = `${r.vendor_id || "?"} #${r.invoice_number || "?"}`;
+    const url   = complianceLinkFor(r);
+    // Slack mrkdwn <url|display> wraps the vendor+invoice# as the clickable
+    // text. When url is null (very old row missing both raw_drive_url and
+    // drive_urls), fall back to plain text so the line still renders cleanly.
+    const linked = url ? `<${url}|${label}>` : label;
+    lines.push(`   • ${acct} \`${r.reason}\` ${linked} (${ts})`);
   }
   if (all.length > 25) {
     lines.push(`   _… ${all.length - 25} more (see Railway log: grep "compliance-detail")_`);
@@ -917,10 +960,13 @@ function buildComplianceSection(report) {
     const bits = [];
     if (report.suppressedByType > 0)   bits.push(`${report.suppressedByType} credit/cc_receipt`);
     if (report.suppressedByStatus > 0) bits.push(`${report.suppressedByStatus} returned/deleted/corrected`);
-    lines.push(`   _Guards suppressed ${bits.join(", ")} (not actionable, not shown above)_`);
+    lines.push(`_Guards suppressed ${bits.join(", ")} (not actionable, not shown above)_`);
   }
-  lines.push("");
-  return lines;
+
+  return {
+    text: `Invoice Upload Quality: ${total} bad uploads across ${byAcct.size} account(s)`,
+    mrkdwn: lines.join("\n"),
+  };
 }
 
 // ── Slack poster (reuses the cron/daily/route.js pattern) ──
@@ -941,7 +987,7 @@ async function postSlack(webhookUrl, text, mrkdwn) {
 }
 
 // ── Digest builder ──
-function buildDigest(c1Results, c2Result, c3Result, complianceResult) {
+function buildDigest(c1Results, c2Result, c3Result) {
   const realDrift  = c1Results.filter((r) => r.classification === "real_drift");
   const expected   = c1Results.filter((r) => r.classification === "expected_cron_drift");
   const structural = c1Results.filter((r) => r.classification === "structural_difference");
@@ -1047,11 +1093,11 @@ function buildDigest(c1Results, c2Result, c3Result, complianceResult) {
     for (const r of noConfig) lines.push(`  • \`${r.tab}\` - add to TABLE_CONFIG`);
     lines.push("");
   }
-  // Compliance section: independent of alarm trigger, appears every run.
-  // Inserted before the run-info footer so the footer stays at the tail.
-  if (complianceResult) {
-    for (const cl of buildComplianceSection(complianceResult)) lines.push(cl);
-  }
+  // v2: Compliance section moved to its own standalone Slack post (see
+  // buildComplianceMessage + the postSlack call in runReconciliationAlarm).
+  // The engineering alarm digest no longer carries the compliance content;
+  // it's posted separately so Kevin can forward it to account leaders
+  // without the dual-write recon noise.
 
   lines.push(`_run ${new Date().toISOString()} · lookback ${LOOKBACK_DAYS}d · gap-min-age ${GAP_MIN_AGE_HOURS}h · quiet ${QUIET_WINDOW_MIN}m_`);
 
@@ -1165,18 +1211,42 @@ export async function runReconciliationAlarm() {
   }
   console.log("");
 
-  const digest = buildDigest(c1, c2, c3, comp);
-  console.log("DIGEST");
+  const digest = buildDigest(c1, c2, c3);
+  console.log("ALARM DIGEST");
   console.log("────────────────────────────────────────────────────────────────────────");
   console.log(digest.mrkdwn);
   console.log("");
+
+  // v2: build the standalone compliance message. Separate post from the
+  // alarm digest so it reads as a clean standalone report Kevin can forward
+  // to account leaders, and so a Slack post failure in one doesn't take
+  // down the other.
+  const complianceMsg = buildComplianceMessage(comp);
+  if (complianceMsg) {
+    console.log("COMPLIANCE MESSAGE (standalone post)");
+    console.log("────────────────────────────────────────────────────────────────────────");
+    console.log(complianceMsg.mrkdwn);
+    console.log("");
+  }
+
   if (DRY_RUN) {
     console.log("(dry-run: not posting to Slack)");
   } else {
+    // Post the alarm digest first.
     await postSlack(SLACK_RECAP_WEBHOOK, digest.text, digest.mrkdwn);
     console.log(SLACK_RECAP_WEBHOOK
-      ? "Posted to SLACK_RECAP_WEBHOOK."
-      : "SLACK_RECAP_WEBHOOK not set; skipped.");
+      ? "Posted alarm digest to SLACK_RECAP_WEBHOOK."
+      : "SLACK_RECAP_WEBHOOK not set; alarm digest skipped.");
+    // Then post the compliance message separately. Wrapped so a post
+    // failure here doesn't cascade.
+    if (complianceMsg && SLACK_RECAP_WEBHOOK) {
+      try {
+        await postSlack(SLACK_RECAP_WEBHOOK, complianceMsg.text, complianceMsg.mrkdwn);
+        console.log("Posted compliance message (separate post) to SLACK_RECAP_WEBHOOK.");
+      } catch (e) {
+        console.error(`Compliance post failed (alarm digest already sent): ${e.message}`);
+      }
+    }
   }
 
   return { alarm: digest.alarm };
