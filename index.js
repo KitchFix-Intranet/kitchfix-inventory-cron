@@ -80,6 +80,51 @@ if (!VALID_DERIVATION_MODES.has(CRON_USE_DERIVATION)) {
 }
 const DERIVATION_MODE = VALID_DERIVATION_MODES.has(CRON_USE_DERIVATION) ? CRON_USE_DERIVATION : "off";
 
+// PR A (review-dashboard cron-side foundation): two related behaviors,
+// both behind one mode flag and both shadow-tested before flipping live.
+//   off    (default) - neither behavior runs. Zero change. Today's loop.
+//   shadow           - the cron tallies what it WOULD do under each behavior
+//                      below, logs per-account counts to the Slack digest,
+//                      but mutates nothing. Validation window before live.
+//   live             - actually breaks the chronic-fail loop + stops new
+//                      duplicate-re-queue appends. Reversible by flipping back.
+//
+// Behavior 1 - RESOLVED-STATUS RESPECT (the chronic-fail loop break):
+//   Extends processedInvoices to also include invoiceUuids that have ANY
+//   review_queue row with status != 'pending' (i.e. accepted or rejected
+//   by the future dashboard's resolve/skip actions). Today this is a no-op
+//   because 0 rows are non-pending (the queue has never resolved a single
+//   row), but it's the foundation the dashboard's resolve action will rely
+//   on: when the human marks a line resolved, the cron will stop re-trying
+//   the whole invoice on subsequent nights. This is the Option B mechanic
+//   (read the status flag) chosen over Option A (write a fake quantity=0
+//   price_history row) - no lies in price_history.
+//
+// Behavior 2 - RE-QUEUE DEDUP GUARD (stop the balloon):
+//   When the gate fails a line and processAccount would append a new
+//   review_queue row, FIRST check whether a row already exists for the
+//   same (invoiceUuid, lineItemText) with status='pending'. If so, do NOT
+//   append a duplicate. The recon found 677 of the 1,056 review_queue
+//   rows (64%) are duplicate re-fires from chronic-fail invoices the
+//   cron re-tries every night; one Cheney invoice's lines had been
+//   re-queued 14 times each. Without this guard the queue keeps growing
+//   silently every night.
+//
+// SCOPE FENCE: PR A is ONLY the cron-side foundation. It does NOT touch
+// the 677 existing duplicate rows (that's PR D, a one-time cleanup with
+// its own show-me-before-delete gate). It does NOT add the dashboard UI
+// (that's PR B, layers on top once A is proven live). It does NOT add
+// bulk-resolve (PR C).
+const VALID_REVIEW_QUEUE_RESPECT_MODES = new Set(["off", "shadow", "live"]);
+const CRON_REVIEW_QUEUE_RESPECT = (process.env.CRON_REVIEW_QUEUE_RESPECT || "off").trim();
+if (!VALID_REVIEW_QUEUE_RESPECT_MODES.has(CRON_REVIEW_QUEUE_RESPECT)) {
+  console.error(
+    `[cron] Invalid CRON_REVIEW_QUEUE_RESPECT="${CRON_REVIEW_QUEUE_RESPECT}". ` +
+    `Valid: ${[...VALID_REVIEW_QUEUE_RESPECT_MODES].join(" / ")}. Falling back to off.`
+  );
+}
+const REVIEW_QUEUE_RESPECT_MODE = VALID_REVIEW_QUEUE_RESPECT_MODES.has(CRON_REVIEW_QUEUE_RESPECT) ? CRON_REVIEW_QUEUE_RESPECT : "off";
+
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -484,6 +529,54 @@ async function processAccount(accountTab, pgCtx) {
     }
   }
 
+  // ── PR A: review-queue-respect (shadow/live behind CRON_REVIEW_QUEUE_RESPECT) ──
+  // Two sets built from the SAME queueRowsForHolds read used above:
+  //   resolvedInvoiceUuids: invoiceUuid for which any review_queue row has
+  //     status != 'pending'. Used to break the chronic-fail loop once the
+  //     future dashboard (PR B) writes resolutions. Today this is a no-op
+  //     because every queue row is status='pending' (recon: 1,056/1,056).
+  //   pendingQueueKeys: "invoiceUuid::lineItemText" tuples that already
+  //     have a status='pending' review_queue row. Used by the
+  //     gate-fail append site below to suppress duplicate re-queue rows
+  //     (the recon found 677 of 1,056 queue rows -- 64% -- are duplicates
+  //     re-fired every night by chronic-fail invoices).
+  const resolvedInvoiceUuids = new Set();
+  const pendingQueueKeys = new Set();
+  if (REVIEW_QUEUE_RESPECT_MODE !== "off") {
+    for (const r of queueRowsForHolds) {
+      if (!accountMatch(r[5], accountTab)) continue;     // account scope (col F)
+      const uuid = String(r[3] || "").trim();             // col D: invoiceUuid
+      if (!uuid) continue;
+      const status = String(r[9] || "").trim().toLowerCase(); // col J: status
+      if (status && status !== "pending") {
+        resolvedInvoiceUuids.add(uuid);
+      } else {
+        // Treat blank status as pending (legacy rows have empty status).
+        const lineText = String(r[1] || "").trim();       // col B: lineItemText
+        pendingQueueKeys.add(`${uuid}::${lineText}`);
+      }
+    }
+  }
+
+  // Behavior 1: resolved-status respect. In shadow we count what WOULD be
+  // skipped; in live we actually skip. Today's shadow count is expected to
+  // be 0 since no row has ever been resolved -- this is the foundation PR B
+  // builds on.
+  let resolvedRespectInvoiceCount = 0;
+  let resolvedRespectLineCount = 0;
+  if (REVIEW_QUEUE_RESPECT_MODE !== "off" && resolvedInvoiceUuids.size > 0) {
+    const matched = newItems.filter((li) => resolvedInvoiceUuids.has(li.invoiceUuid));
+    const matchedInvoiceSet = new Set(matched.map((li) => li.invoiceUuid));
+    resolvedRespectInvoiceCount = matchedInvoiceSet.size;
+    resolvedRespectLineCount = matched.length;
+    if (REVIEW_QUEUE_RESPECT_MODE === "live") {
+      newItems = newItems.filter((li) => !resolvedInvoiceUuids.has(li.invoiceUuid));
+      console.log(`[${accountTab}] [review-queue-respect/live] skipped ${resolvedRespectInvoiceCount} resolved invoice(s), ${resolvedRespectLineCount} line(s)`);
+    } else {
+      console.log(`[${accountTab}] [review-queue-respect/shadow] WOULD skip ${resolvedRespectInvoiceCount} resolved invoice(s), ${resolvedRespectLineCount} line(s)`);
+    }
+  }
+
   // ── Credit filter (Stage 0) ──
   // invoice_submissions rows with type='credit' represent credit memos.
   // They're real financial records (already extracted and stored in
@@ -622,6 +715,32 @@ async function processAccount(accountTab, pgCtx) {
   const batchNewIds = {}; // index → generated itemId (for batch_match resolution)
   let matched = 0, created = 0, queued = 0, held = 0, skipped = 0;
 
+  // ── PR A: re-queue dedup guard ──
+  // Wrap newQueueRows.push to check whether a row already exists for the
+  // same (invoiceUuid, lineItemText) with status='pending'. Shadow tallies
+  // what would be suppressed; live actually suppresses. Off no-ops.
+  // Indices match shapes.QUEUE_COLS: [0]=queueId [1]=lineItemText [3]=invoiceUuid
+  let reQueueSuppressed = 0;
+  function maybePushQueueRow(row) {
+    if (REVIEW_QUEUE_RESPECT_MODE === "off" || pendingQueueKeys.size === 0) {
+      newQueueRows.push(row);
+      return;
+    }
+    const uuid = String(row[3] || "").trim();
+    const lineText = String(row[1] || "").trim();
+    const key = `${uuid}::${lineText}`;
+    const alreadyPending = pendingQueueKeys.has(key);
+    if (!alreadyPending) {
+      newQueueRows.push(row);
+      return;
+    }
+    reQueueSuppressed++;
+    if (REVIEW_QUEUE_RESPECT_MODE === "live") {
+      return;                  // skip the append (real dedup)
+    }
+    newQueueRows.push(row);    // shadow: still append, tally only
+  }
+
   // PR 3: catch-weight derivation shadow tally. Only populated when
   // DERIVATION_MODE !== "off". Buckets per the held-out probe + PR 3 spec:
   //   wouldRecover - currentGate FAIL, derivedGate PASS (the win)
@@ -736,7 +855,7 @@ async function processAccount(accountTab, pgCtx) {
 
     if (wouldPromote && !arithmeticCheck(li)) {
       held++;
-      newQueueRows.push(shapes.makeQueueRow({
+      maybePushQueueRow(shapes.makeQueueRow({
         queueId:            `q_${uid()}`,
         lineItemText:       li.description,
         vendor:             li.vendor,
@@ -781,7 +900,7 @@ async function processAccount(accountTab, pgCtx) {
       } else {
         // Low confidence → queue for review
         queued++;
-        newQueueRows.push(shapes.makeQueueRow({
+        maybePushQueueRow(shapes.makeQueueRow({
           queueId:            `q_${uid()}`,
           lineItemText:       li.description,
           vendor:             li.vendor,
@@ -804,7 +923,7 @@ async function processAccount(accountTab, pgCtx) {
       if (r.confidence !== undefined && r.confidence >= 60) {
         // Actually a possible match that should be reviewed
         queued++;
-        newQueueRows.push(shapes.makeQueueRow({
+        maybePushQueueRow(shapes.makeQueueRow({
           queueId:            `q_${uid()}`,
           lineItemText:       li.description,
           vendor:             li.vendor,
@@ -971,6 +1090,21 @@ async function processAccount(accountTab, pgCtx) {
     }
   }
 
+  // PR A: attach review-queue-respect tally to the per-account summary.
+  // Present in both shadow and live modes (so live can report actual
+  // skip/suppress counts the same way shadow reported would-counts).
+  if (REVIEW_QUEUE_RESPECT_MODE !== "off") {
+    summary.reviewQueueRespect = {
+      mode: REVIEW_QUEUE_RESPECT_MODE,
+      resolvedInvoiceCount: resolvedRespectInvoiceCount,
+      resolvedLineCount: resolvedRespectLineCount,
+      reQueueSuppressed,
+      pendingQueueKeysSize: pendingQueueKeys.size,    // diagnostic: how many "pending" rows already in the queue for this account
+      resolvedInvoiceUuidsSize: resolvedInvoiceUuids.size,
+    };
+    console.log(`[${accountTab}] [review-queue-respect/${REVIEW_QUEUE_RESPECT_MODE}] resolvedInvoices=${resolvedRespectInvoiceCount}, resolvedLines=${resolvedRespectLineCount}, reQueueSuppressed=${reQueueSuppressed}, pendingKeys=${pendingQueueKeys.size}, resolvedUuids=${resolvedInvoiceUuids.size}`);
+  }
+
   // PR 8.3 dry-run: transform the Sheets row arrays into PG row shape,
   // compute the dedup divergence, attach the per-account diff to the
   // summary so main() can post the aggregate digest. Writes NOTHING to PG.
@@ -1028,6 +1162,61 @@ async function processAccount(accountTab, pgCtx) {
 // samples are also written to console.log via processAccount so Railway log
 // grep can pull the unbounded set if Slack clips. Returns empty string when
 // shadow data is absent (off / live).
+// PR A: Slack section for review-queue-respect (shadow or live). Reports
+// per-account counts of: (a) resolved invoices the cron would skip / did
+// skip on this run, and (b) duplicate re-queue appends suppressed.
+// Returns empty string when no per-account result carries the tally.
+function buildReviewQueueRespectSection(results) {
+  const tallied = results.filter((r) => r.reviewQueueRespect);
+  if (tallied.length === 0) return "";
+
+  // Mode is per-account but env-driven so identical across accounts; pick
+  // the first to label the digest heading.
+  const mode = tallied[0].reviewQueueRespect.mode;
+
+  let totalResolvedInvoices = 0;
+  let totalResolvedLines    = 0;
+  let totalReQueueSuppressed = 0;
+  const byAccount = [];
+  for (const r of tallied) {
+    const t = r.reviewQueueRespect;
+    totalResolvedInvoices  += t.resolvedInvoiceCount;
+    totalResolvedLines     += t.resolvedLineCount;
+    totalReQueueSuppressed += t.reQueueSuppressed;
+    if (t.resolvedInvoiceCount + t.reQueueSuppressed > 0) {
+      byAccount.push({ account: r.account, ...t });
+    }
+  }
+
+  // Sort by activity desc so the noisy accounts surface first.
+  byAccount.sort((a, b) =>
+    (b.resolvedInvoiceCount + b.reQueueSuppressed) -
+    (a.resolvedInvoiceCount + a.reQueueSuppressed)
+  );
+
+  const verbResolved   = mode === "live" ? "skipped"   : "WOULD skip";
+  const verbSuppressed = mode === "live" ? "suppressed" : "WOULD suppress";
+  const heading = mode === "live"
+    ? `\n*🔁 Review-queue respect* (CRON_REVIEW_QUEUE_RESPECT=live)\n`
+    : `\n*🔁 Review-queue respect shadow* (CRON_REVIEW_QUEUE_RESPECT=shadow)\n`;
+
+  let text = heading;
+  text += `   resolved-status respect: ${verbResolved} ${totalResolvedInvoices} resolved invoice(s), ${totalResolvedLines} line(s)\n`;
+  text += `   re-queue dedup guard:    ${verbSuppressed} ${totalReQueueSuppressed} duplicate append(s)\n`;
+  if (byAccount.length > 0) {
+    text += `   per-account (only accounts with activity):\n`;
+    for (const a of byAccount) {
+      const bits = [];
+      if (a.resolvedInvoiceCount > 0) bits.push(`${a.resolvedInvoiceCount} resolved inv (${a.resolvedLineCount} line)`);
+      if (a.reQueueSuppressed > 0)    bits.push(`${a.reQueueSuppressed} dup re-queue`);
+      text += `      ${a.account}: ${bits.join(", ")}\n`;
+    }
+  } else {
+    text += `   (no activity this run - foundation in place, waiting for PR B's resolve actions to start producing non-pending rows)\n`;
+  }
+  return text;
+}
+
 function buildDerivationShadowSection(results) {
   const shadowResults = results.filter((r) => r.derivationShadow);
   if (shadowResults.length === 0) return "";
@@ -1142,6 +1331,7 @@ async function postSlackDigest(results) {
   // PR 3: catch-weight derivation shadow section (fires only when shadow data
   // is attached to per-account results, i.e. CRON_USE_DERIVATION=shadow).
   text += buildDerivationShadowSection(results);
+  text += buildReviewQueueRespectSection(results);
 
   if (isMonday) {
     text += "\n*📋 Weekly Catalog Health:*\n";
@@ -1292,6 +1482,9 @@ async function main() {
   // the cron took without needing the env var page.
   if (DERIVATION_MODE !== "off") {
     console.log(`\n[derivation] CRON_USE_DERIVATION=${DERIVATION_MODE}: catch-weight derivation active (${DERIVATION_MODE === "shadow" ? "tallies only, NO live behavior change" : "LIVE: gate + price_history use derived quantity"})`);
+  }
+  if (REVIEW_QUEUE_RESPECT_MODE !== "off") {
+    console.log(`\n[review-queue-respect] CRON_REVIEW_QUEUE_RESPECT=${REVIEW_QUEUE_RESPECT_MODE}: ${REVIEW_QUEUE_RESPECT_MODE === "shadow" ? "tallies only, NO live behavior change" : "LIVE: resolved-status invoices skipped + duplicate re-queue appends suppressed"}`);
   }
 
   // PR 8.3: PG dry-run context (only when CRON_USE_POSTGRES === "dry-run").
