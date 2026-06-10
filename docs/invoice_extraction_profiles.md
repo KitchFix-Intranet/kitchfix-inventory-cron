@@ -77,11 +77,13 @@ probes. Honest about what's proven; honest about what's not.
 - `Total Weight ##.##` / `Weight: ##.##` sub-line (Ben E Keith) - verified on BEK Beef Chuck (`weightLineValue=103`), plus bonus Pork Belly (28.95#), Beef Flank Steak (83.10#), Beef Ribeye (44.85#), Beef Tenderloin (14.75#), Beef Tri-Tip (16.17#), Beef Flat Iron (22.60#), Chicken Thigh (20.88#). Every catch-weight line on BEK F3 invoices recovers via `catch_weight_subline` derivation. Legacy claude-qty gate FAILed every one; derived gate PASSes every one.
 - `TOTAL WEIGHT: ##.###` and per-case `CASE: WEIGHT: ##.###` (Gordon Food Service) - verified on Beef Flank (`weightLineValue=35.500`, 35.5 × 9.55 = 339.03 ✓) and Beef Grnd 80/10 (`weightLineValue=76.900`, 76.9 × 6.53 = 502.16 ✓).
 - Weight-in-SHIPPED-column form (What Chefs Want, on lines that do NOT have a "Case weights" sub-line) - verified on WCW Grouper (`shippedCount=14.6`, `unit=lb`, 14.6 × 30.24 = 441.50 ✓). Goes through `shipped_passthrough`, not `catch_weight_subline`, but produces the correct LB result. NEW FINDING: WCW has BOTH catch-weight presentations - some lines use the sub-line, some put the weight directly in the SHIPPED column. The derivation handles both.
+- `T/WT= ##.###` sub-line (Sysco) - validated by the F5 recon on Sysco #519239063: BEEF FLANK 193 captured `weightLineValue=157.90` (157.90 × $11.39 = $1798.48 ✓), BEEF STRIP LOIN 0X1 1/4 USA captured `weightLineValue=50.10` (50.10 × $9.27 = $464.43 ✓). Both lines: legacy claude-qty gate FAIL -> derived gate PASS. The shared catch-weight extractor handles Sysco T/WT= without any new logic.
+
+**PARTIALLY PROVEN (marker captures into weightLineValue, but other line fields are unreliable on the same line so derivation extracts the right weight while the line may still gate-fail):**
+- `Weights: TOTAL= ##.##` sub-line (Kuna) - validated by the F5 recon on Kuna #217995-00: BEEF BRISKET CO FLKT 185 captured `weightLineValue=15.04`. The marker WORKS - the prompt correctly extracts the total weight from the Weights:TOTAL= sub-line. BUT Kuna's scan-quality residue often misreads `unitPrice` or `amount` on the same line (15.04 × $4.02 = $60.46 but amount = $57.11, ~6% off due to a unitPrice misread). Expected behavior in shadow: Kuna catch-weight recovers PARTIALLY - some lines appear in would-recover; others appear in residual due to the scan-quality limit, not due to a derivation bug. The residual is the correct review-queue floor for blurry Kuna scans, not an alarm.
 
 **UNPROVEN (in the prompt but not yet validated against a real invoice):**
 - `Case weights: X.XX, ..., TOTAL: Y.YY` sub-line form (What Chefs Want) - this is the variant the census rationales described, but the WCW test invoice in PR 1's probe didn't have it. Validated at scale by the shadow run when WCW lines that currently fail the gate get rescued (or don't) via `catch_weight_subline`.
-- `T/WT= ##.###` (Sysco) - not yet exercised by a probe. Shadow run will surface Sysco recovery counts.
-- `Weights: TOTAL= ##.## ==>>>>` (Kuna) - not yet exercised. Shadow run will surface Kuna recovery counts (and likely also the F5 image-quality residue for blurry scans).
 - Printed WEIGHT column on Cheney F4 catch-weight lines (where the prompt asks Claude to put the weight value in `weightLineValue`) - the PR 1 probe found Claude tends to put the weight in `shippedCount` instead on Cheney lines, which still produces the correct LB result via `shipped_passthrough` but does NOT exercise `catch_weight_subline`. Whether this is good-enough or whether we need to tighten the prompt for Cheney is a question the shadow run will answer.
 
 **Honest-null principle - PROVEN as a universal load-bearing assertion:**
@@ -92,6 +94,66 @@ gate=HELD - none were back-computed, none silently passed. This is the
 load-bearing assertion that distinguishes "honest null routed to review" from
 "failed the gate" and is what protects against the Stage A circular-gate
 bug class. The principle is universal across families and verified at scale.
+
+### F5 cluster recon findings (Sysco / Shamrock / Kuna)
+
+A targeted F5 recon (read-only, ~$0.30 in API costs) validated the markers
+above on real invoices and surfaced two additional findings that close the
+F5 work without any new code. See above for the Sysco PROVEN + Kuna
+PARTIALLY PROVEN status updates produced by this recon.
+
+**Shamrock density-misread (NEW failure mode, NOT catch-weight):**
+
+The Shamrock F5 invoices in the census show a distinct failure pattern that
+is separate from catch-weight: the model loses column alignment in
+Shamrock's dense "compartment totals" layout (DRY / FROZEN / REFRIG
+sections) and reads the SAME value into both the qty cell and the amount
+cell. Examples from the census rationales:
+- `HP BUTTERMILK 1% LF`: `qty=7 unit=$22.09 amount=$22.09` (math foots only if qty=1; the actual qty was 1, the model read 7 from an adjacent cell)
+- `HALF & HALF, QT REFRIGER`: `qty=14 unit=$22.21 amount=$22.21` (same pattern, actual qty was 1)
+- `JUICE, APPLE 100% FRT`: `qty=3 unit=$35.98 amount=$35.98` (same pattern)
+
+This affects ~14 of the 25 Shamrock failures in the census (the other 11
+are catch-weight or scan-quality). The arithmetic gate CORRECTLY catches
+these: the line fails, routes to `review_queue` with reason="arithmetic_fail",
+and a human resolves it. NO vendor-specific extraction code is added.
+Adding a Shamrock-specific prompt hint to fix column alignment would violate
+the spec's "detect by STRUCTURE" principle for a low-volume failure mode
+(~2% of corpus) that the gate already handles safely. Documented as a
+known review-queue resident.
+
+**Rasterization is a dead end for blurry scans:**
+
+The recon tested whether higher-DPI rendering of bad Kuna scans (via
+qlmanage at -s 2500, approximately 225 DPI) would recover readable numbers
+vs sending the natively-embedded JPEG. It does NOT, and on the 2 tested
+invoices (#22416-00, #215530-00) the rasterized variant produced WORSE
+results: more null unitPrice/amount cells (5/8 and 3/7 null) than the
+native variant (0/4 and 0/7 null), plus hallucinated descriptions like
+`"CRIS:BULK PREPACKAGED S:OZ ORDER:ID UNIT"` and
+`"TELL AVOCADO SET 1 GAL 4/1 ABIEO"`.
+
+Why: the embedded JPEG in those PDFs is already approximately 135 DPI on
+US-letter (1200x1600 pixels in a 385 KB JPEG), which encodes the original
+scan quality. The blur is in the SOURCE scan (someone photographed or
+scanned the invoice at low quality), not in the encoding. Re-rendering
+from that source at higher pixel count can't add information that is not
+there; it just produces PNG re-encoding artifacts and gives Claude more
+pixels to hallucinate descriptions from.
+
+The approximately 10-11 blurry Kuna and Shamrock invoices (approximately
+1.4% of corpus) are an honest review-queue floor. This is an upload-quality
+problem, not a pipeline problem to engineer around. (See "Logged adjacent
+items" - the upload-compliance report we are about to spec will surface
+the same invoices from the upload-discipline angle.)
+
+**F5 closure:**
+
+No code PR is needed for F5. The PR 3 shadow window will validate at scale:
+expect Sysco/Kuna catch-weight lines to appear in `would-recover` as fresh
+F5 invoices flow through, with the residual concentrated in the
+scan-quality floor + Shamrock column-misreads. Both of those residual
+buckets are correct behavior, not bugs.
 
 ### Refined build order (by volume × failure, with the catch-weight reframe)
 
@@ -334,3 +396,14 @@ genuinely can't recover.
 - Successor project: promote this family-aware extraction intelligence UPSTREAM into invoice capture
   (the cron hybrid is the prototype; promote once proven). This census IS the requirements doc and
   the baseline to measure the rebuild against.
+- Shamrock density-misread is a candidate for the eventual review-dashboard's "common patterns"
+  panel. When the dashboard is built, Shamrock column-alignment fails will be a recurring resident
+  worth surfacing as a GROUP (one-click bulk-resolve workflow on the same failure shape) rather
+  than as individual one-off review items. Volume approximately 14 invoices in census.
+- Blurry-scan floor (the Kuna + Shamrock N/A invoices, approximately 1.4% of corpus per the F5
+  recon) directly feeds the planned upload-compliance report. The same invoices that are unreadable
+  by extraction are unreadable because they were UPLOADED badly (low-res photo, crumpled, poor
+  lighting). The compliance report and the F5 scan-quality floor look at the same invoices from
+  two angles: extraction sees them as "unrecoverable lines"; compliance sees them as "operator
+  uploaded a bad scan." Both pipelines should surface the same uuids so the operator gets a
+  single coherent signal, not two contradictory ones.
