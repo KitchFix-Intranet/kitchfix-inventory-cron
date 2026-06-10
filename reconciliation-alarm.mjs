@@ -61,6 +61,28 @@ function getArg(name, fallback) {
 const DRY_RUN           = getArg("dry-run", "false").toLowerCase() === "true";
 const LOOKBACK_DAYS     = parseInt(getArg("lookback-days", "7"), 10);
 const GAP_MIN_AGE_HOURS = parseInt(getArg("gap-min-age-hours", "24"), 10);
+
+// ── Upload-compliance constants (separate from CHECK 2 + CHECK 3) ──
+// The compliance report uses a longer lookback (14d, vs 7d for the alarm) and
+// applies explicit guards so the output is safe to share with non-engineers.
+// See complianceReport() below for the full scope statement.
+const COMPLIANCE_LOOKBACK_DAYS = parseInt(getArg("compliance-lookback-days", "14"), 10);
+
+// Excluded types for the EMPTY bucket (these legitimately produce 0 line items
+// and are NOT bad uploads):
+//   'credit'     - credit memos; Stage 0 already skips these from inventory.
+//   'cc_receipt' - credit-card receipts; different shape from invoices, no
+//                  vendor line items expected.
+const COMPLIANCE_EMPTY_EXCLUDED_TYPES = new Set(["credit", "cc_receipt"]);
+
+// Excluded statuses for the EMPTY bucket (already handled by the human side,
+// NOT actionable for compliance):
+//   'returned'  - workflow rejected back to operator.
+//   'deleted'   - removed from workflow.
+//   'corrected' - operator already noticed and submitted a fix. Flagging here
+//                 would punish self-correction; if the corrected re-submission
+//                 is ALSO empty, it surfaces under its own 'sent' status.
+const COMPLIANCE_EMPTY_EXCLUDED_STATUSES = new Set(["returned", "deleted", "corrected"]);
 const QUIET_WINDOW_MIN  = parseInt(getArg("quiet-window-min", "10"), 10);
 
 // ── Env ──
@@ -741,6 +763,166 @@ async function check3() {
   return { lookback: LOOKBACK_DAYS, failed: failed || [] };
 }
 
+// ── Upload-compliance report (separate from CHECK 2 + CHECK 3) ──
+//
+// Same underlying signals as check2 (EMPTY: ai_scan_complete with 0 line
+// items) and check3 (FAILED: ai_scan_status='failed'), but with a longer
+// lookback window (14d) and explicit guards that make the output safe to
+// share with non-engineers. This report is for Kevin's COMPLIANCE view:
+// he reads it and addresses account leaders personally. It does NOT
+// auto-message anyone.
+//
+// STRICT SCOPE BOUNDARY - do not collapse later:
+//
+// This report is ONLY about UPLOAD-QUALITY signals (FAILED + EMPTY).
+// It MUST NOT include lines held by the arithmetic gate for catch-weight
+// math, F5 density misreads, Shamrock column-misreads, or any other
+// SYSTEM-side extraction problem. Those are different problem domains
+// with different owners and a different audience:
+//   - Upload quality   -> the account leader who uploaded a bad scan
+//                         (Kevin's compliance conversation)
+//   - Extraction logic -> engineering / Kevin's tech-debt backlog
+//                         (the cron's arithmetic_fail and the F5 floor)
+// Conflating them would produce mixed messages and erode the compliance
+// report's credibility. The two MUST stay siloed at the data layer
+// (this function keys ONLY on ai_scan_status and 0-line-items, NEVER on
+// review_queue, arithmetic_fail, or any post-extraction gate signal).
+async function complianceReport() {
+  const since  = new Date(Date.now() - COMPLIANCE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const cutoff = new Date(Date.now() - GAP_MIN_AGE_HOURS         *      60 * 60 * 1000).toISOString();
+
+  // FAILED (ai_scan_status='failed'). No type/status guard here: a failed
+  // scan is a definitive bad-upload signal regardless of how the workflow
+  // subsequently labeled the submission.
+  const { data: failed, error: fE } = await supa
+    .from("invoice_submissions")
+    .select("id, account_key, vendor_id, invoice_number, submitted_at, type, status, ai_scan_status")
+    .eq("ai_scan_status", "failed")
+    .eq("is_historical", false)
+    .gte("submitted_at", since)
+    .lte("submitted_at", cutoff)
+    .order("submitted_at", { ascending: false });
+  if (fE) throw new Error(`compliance FAILED query: ${fE.message}`);
+
+  // EMPTY candidates (ai_scan_complete=TRUE but 0 ai_line_items). Bulk
+  // line-item lookup matches check2's pattern.
+  const { data: candidates, error: cE } = await supa
+    .from("invoice_submissions")
+    .select("id, account_key, vendor_id, invoice_number, submitted_at, type, status, ai_scan_status")
+    .eq("ai_scan_complete", true)
+    .eq("is_historical", false)
+    .gte("submitted_at", since)
+    .lte("submitted_at", cutoff)
+    .order("submitted_at", { ascending: false });
+  if (cE) throw new Error(`compliance EMPTY candidates: ${cE.message}`);
+
+  const candidateIds = candidates.map((c) => c.id);
+  const present = new Set();
+  for (let i = 0; i < candidateIds.length; i += 200) {
+    const slice = candidateIds.slice(i, i + 200);
+    const { data, error } = await supa
+      .from("ai_line_items")
+      .select("invoice_uuid")
+      .in("invoice_uuid", slice);
+    if (error) throw new Error(`compliance EMPTY line items: ${error.message}`);
+    for (const r of data || []) present.add(r.invoice_uuid);
+  }
+  const emptyAll = candidates.filter((c) => !present.has(c.id));
+
+  // Apply guards to EMPTY only. Telemetry: count how many were suppressed
+  // by each guard so the report can report its own false-positive rate.
+  const suppressedByType    = emptyAll.filter((r) => COMPLIANCE_EMPTY_EXCLUDED_TYPES.has(r.type)).length;
+  const suppressedByStatus  = emptyAll.filter((r) =>
+    !COMPLIANCE_EMPTY_EXCLUDED_TYPES.has(r.type) &&
+    COMPLIANCE_EMPTY_EXCLUDED_STATUSES.has(r.status)
+  ).length;
+  const empty = emptyAll.filter((r) =>
+    !COMPLIANCE_EMPTY_EXCLUDED_TYPES.has(r.type) &&
+    !COMPLIANCE_EMPTY_EXCLUDED_STATUSES.has(r.status)
+  );
+
+  return {
+    lookback: COMPLIANCE_LOOKBACK_DAYS,
+    failed,
+    empty,
+    emptyAllCount: emptyAll.length,
+    suppressedByType,
+    suppressedByStatus,
+  };
+}
+
+// Format the compliance section as Slack-mrkdwn lines. Returns an array of
+// strings (caller joins). Returns [] if nothing to report so the caller can
+// no-op cleanly.
+function buildComplianceSection(report) {
+  if (!report) return [];
+  const total = report.failed.length + report.empty.length;
+  const lines = [];
+
+  if (total === 0) {
+    lines.push(`*📤 Invoice Upload Quality - last ${report.lookback}d*`);
+    lines.push(`   ✓ Clean. 0 bad uploads in window.`);
+    lines.push("");
+    return lines;
+  }
+
+  // Per-account summary, sorted by total bad uploads (outliers float to top).
+  const byAcct = new Map();
+  for (const r of report.failed) {
+    const a = r.account_key || "(no account)";
+    if (!byAcct.has(a)) byAcct.set(a, { failed: 0, empty: 0 });
+    byAcct.get(a).failed++;
+  }
+  for (const r of report.empty) {
+    const a = r.account_key || "(no account)";
+    if (!byAcct.has(a)) byAcct.set(a, { failed: 0, empty: 0 });
+    byAcct.get(a).empty++;
+  }
+  const ranked = [...byAcct.entries()].sort((a, b) =>
+    (b[1].failed + b[1].empty) - (a[1].failed + a[1].empty)
+  );
+
+  lines.push(`*📤 Invoice Upload Quality - last ${report.lookback}d*`);
+  lines.push(`   Total bad uploads: ${total} across ${byAcct.size} account(s)`);
+  lines.push("");
+  for (const [a, c] of ranked) {
+    const bits = [];
+    if (c.failed) bits.push(`${c.failed} failed`);
+    if (c.empty)  bits.push(`${c.empty} empty`);
+    lines.push(`   • *${a}*: ${c.failed + c.empty} (${bits.join(", ")})`);
+  }
+  lines.push("");
+
+  // Per-invoice detail, most recent first, mixed FAILED + EMPTY. Capped at
+  // 25 in Slack; full set lands in console.log for Railway grep.
+  const all = [
+    ...report.failed.map((r) => ({ ...r, reason: "FAILED" })),
+    ...report.empty.map((r) => ({ ...r, reason: "EMPTY" })),
+  ].sort((a, b) => (b.submitted_at || "").localeCompare(a.submitted_at || ""));
+
+  lines.push(`   *Per invoice (most recent first):*`);
+  for (const r of all.slice(0, 25)) {
+    const ts = (r.submitted_at || "").slice(0, 10);
+    const acct = (r.account_key || "?").padEnd(14);
+    lines.push(`   • ${acct} \`${r.reason}\` ${r.vendor_id || "?"} #${r.invoice_number || "?"} (${ts})`);
+  }
+  if (all.length > 25) {
+    lines.push(`   _… ${all.length - 25} more (see Railway log: grep "compliance-detail")_`);
+  }
+
+  // Footer: false-positive telemetry. Surfaces guard hits so we can spot a
+  // guard going wrong (e.g. if it ever suppresses 100% of EMPTY).
+  if (report.suppressedByType > 0 || report.suppressedByStatus > 0) {
+    lines.push("");
+    const bits = [];
+    if (report.suppressedByType > 0)   bits.push(`${report.suppressedByType} credit/cc_receipt`);
+    if (report.suppressedByStatus > 0) bits.push(`${report.suppressedByStatus} returned/deleted/corrected`);
+    lines.push(`   _Guards suppressed ${bits.join(", ")} (not actionable, not shown above)_`);
+  }
+  lines.push("");
+  return lines;
+}
+
 // ── Slack poster (reuses the cron/daily/route.js pattern) ──
 async function postSlack(webhookUrl, text, mrkdwn) {
   if (!webhookUrl) return;
@@ -759,7 +941,7 @@ async function postSlack(webhookUrl, text, mrkdwn) {
 }
 
 // ── Digest builder ──
-function buildDigest(c1Results, c2Result, c3Result) {
+function buildDigest(c1Results, c2Result, c3Result, complianceResult) {
   const realDrift  = c1Results.filter((r) => r.classification === "real_drift");
   const expected   = c1Results.filter((r) => r.classification === "expected_cron_drift");
   const structural = c1Results.filter((r) => r.classification === "structural_difference");
@@ -865,6 +1047,12 @@ function buildDigest(c1Results, c2Result, c3Result) {
     for (const r of noConfig) lines.push(`  • \`${r.tab}\` - add to TABLE_CONFIG`);
     lines.push("");
   }
+  // Compliance section: independent of alarm trigger, appears every run.
+  // Inserted before the run-info footer so the footer stays at the tail.
+  if (complianceResult) {
+    for (const cl of buildComplianceSection(complianceResult)) lines.push(cl);
+  }
+
   lines.push(`_run ${new Date().toISOString()} · lookback ${LOOKBACK_DAYS}d · gap-min-age ${GAP_MIN_AGE_HOURS}h · quiet ${QUIET_WINDOW_MIN}m_`);
 
   return { alarm, text: headline.replace(/[*`]/g, ""), mrkdwn: lines.join("\n") };
@@ -952,7 +1140,32 @@ export async function runReconciliationAlarm() {
   }
   console.log("");
 
-  const digest = buildDigest(c1, c2, c3);
+  // ── Upload-compliance report (independent of alarm trigger; fires every run) ──
+  // Same signals as check2 + check3, but with 14d lookback and explicit
+  // false-positive guards. Aimed at Kevin's compliance view, not the engineering
+  // alarm. See complianceReport() for the strict-scope-boundary note.
+  console.log("COMPLIANCE - upload quality report (last 14d, guards applied)");
+  console.log("────────────────────────────────────────────────────────────────────────");
+  let comp;
+  try {
+    comp = await complianceReport();
+    console.log(`  FAILED: ${comp.failed.length} (all type)`);
+    console.log(`  EMPTY:  ${comp.empty.length} (after type+status guards)`);
+    console.log(`  Guards suppressed: ${comp.suppressedByType} credit/cc_receipt, ${comp.suppressedByStatus} returned/deleted/corrected`);
+    // Full set to console for Railway grep (Slack section is capped at 25)
+    for (const r of comp.failed) {
+      console.log(`  [compliance-detail] FAILED  acct=${r.account_key}  vendor=${r.vendor_id || "?"}  inv#=${r.invoice_number || "?"}  submitted=${r.submitted_at}  status=${r.status}`);
+    }
+    for (const r of comp.empty) {
+      console.log(`  [compliance-detail] EMPTY   acct=${r.account_key}  vendor=${r.vendor_id || "?"}  inv#=${r.invoice_number || "?"}  submitted=${r.submitted_at}  status=${r.status}`);
+    }
+  } catch (err) {
+    console.log(`  ✗ COMPLIANCE failed: ${err.message}`);
+    comp = null;
+  }
+  console.log("");
+
+  const digest = buildDigest(c1, c2, c3, comp);
   console.log("DIGEST");
   console.log("────────────────────────────────────────────────────────────────────────");
   console.log(digest.mrkdwn);
