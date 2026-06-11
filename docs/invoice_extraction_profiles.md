@@ -156,6 +156,37 @@ F5 invoices flow through, with the residual concentrated in the
 scan-quality floor + Shamrock column-misreads. Both of those residual
 buckets are correct behavior, not bugs.
 
+### Known shadow-only issues (resolve when derivation work resumes)
+
+**Arithmetic gate accepted a non-reconciling derivation as "would-recover" (logged 2026-06-11):**
+
+Run: manual Railway cron 2026-06-11 ~16:43 UTC (deploy `12328829`), `CRON_USE_DERIVATION=shadow`.
+
+- Account: TBJ - FL. Vendor: Cheney Brothers. Invoice: 6910808956. Line: "SALMON CHILE FLT 3".
+- Derivation: old quantity 8 lb -> derived 77.98 lb, unitPrice $8.16.
+- Reconciliation: 77.98 x 8.16 = $636.32, but invoice line amount = $635.32 -> derived value is
+  $1.00 (~0.16%) OVER.
+- The gate tallied this as `would-recover` anyway (part of TBJ-FL `would-recover=4`) instead of
+  failing it.
+- The other 3 `would-recover` lines on this run reconciled to the penny:
+  BEEF GROUND PATTY 50 x 5.36 = 268.00; Sysco chicken 49 x 2.159 = 105.79;
+  SHRIMP 40 x 6.38 = 255.20. SALMON is the lone non-reconciler.
+
+Why it matters (standing principle, see Core principle #4 below): "a null is honest, a back-computed
+value is a lie, the gate must be able to FAIL." Here the gate did NOT fail on a value that doesn't
+reconcile. Harmless today (shadow only tallies). If derivation is ever flipped to live, this would
+write a wrong quantity.
+
+Resolve when catch-weight work resumes:
+
+1. The derived weight may itself be slightly wrong - ~77.86 lb would hit the $635.32 invoice amount
+   (vs derived 77.98, ~0.12 lb high). Check the weight sub-line extraction for this invoice.
+2. The gate's reconciliation tolerance is evidently wide enough to pass a ~$1 / ~0.16% miss as
+   `would-recover`. Decide whether `would-recover` should require tighter (near-penny) reconciliation,
+   so a non-reconciling derivation fails the gate instead of passing.
+
+Bucket: catch-weight / extraction. NOT a dup-bug item.
+
 ### Refined build order (by volume × failure, with the catch-weight reframe)
 
 1. **Shared catch-weight sub-line extractor** - FIRST. Fixes WCW (22, biggest vendor), Gordon (5),
