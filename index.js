@@ -756,6 +756,13 @@ async function processAccount(accountTab, pgCtx) {
   const wouldRegressSamples = [];
   const SAMPLE_LIMIT_PER_ACCOUNT = 5;
 
+  // PR 6 (durable catch-weight log): durable record of every catch_weight_subline
+  // derivation the cron detects. UNCAPPED per account (every detection goes to
+  // the log tab, unlike the digest samples which are capped at 5/account). The
+  // Slack-digest samples evaporate; this tab persists. Append-only; gets one
+  // batched append per account at the end of processAccount.
+  const catchWeightDetections = [];
+
   for (const r of results) {
     const li = newItems[r.index];
     if (!li) continue;
@@ -788,6 +795,30 @@ async function processAccount(accountTab, pgCtx) {
     //            then fails so the line routes to review_queue.
     if (wouldPromote && DERIVATION_MODE !== "off") {
       const derived = deriveLineItemQuantity(li);
+
+      // PR 6 (durable log): capture every catch_weight_subline detection
+      // regardless of shadow/live mode. Logged at end of processAccount.
+      // shipped_passthrough is a no-op (qty unchanged), not worth logging.
+      // honest_null_review means derivation tried but had no weight to use -
+      // also not the cron's "I detected a catch-weight" case.
+      if (derived.reason === "catch_weight_subline") {
+        catchWeightDetections.push({
+          timestamp:        new Date().toISOString(),
+          account:          accountTab,
+          vendor:           li.vendor || "",
+          invoiceUuid:      li.invoiceUuid || "",
+          invoiceNumber:    li.invoiceNumber || "",
+          description:      li.description || "",
+          oldQty:           li.quantity,
+          oldUnit:          li.unit || "",
+          derivedQty:       derived.quantity,
+          derivedUnit:      derived.unit,
+          unitPrice:        li.unitPrice,
+          amount:           li.extendedPrice,
+          derivationReason: derived.reason,
+          cronMode:         DERIVATION_MODE,
+        });
+      }
 
       if (DERIVATION_MODE === "shadow") {
         const currentPass = arithmeticCheck(li);
@@ -1065,6 +1096,32 @@ async function processAccount(accountTab, pgCtx) {
   if (newAliasRows.length) await appendRows(INVENTORY_SHEET_ID, "item_aliases!A1", newAliasRows);
   if (newPriceRows.length) await appendRows(INVENTORY_SHEET_ID, "price_history!A1", newPriceRows);
   if (newQueueRows.length) await appendRows(INVENTORY_SHEET_ID, "review_queue!A1", newQueueRows);
+
+  // PR 6 (durable catch-weight log): append the collected detections to the
+  // catchweight_derivations_log tab. Non-blocking - if the tab doesn't exist
+  // yet or the append fails for any reason, log + continue. Cron's primary
+  // job (matching + queueing) must not be held up by the auxiliary log.
+  //
+  // Schema (14 cols): A timestamp | B account | C vendor | D invoiceUuid |
+  // E invoiceNumber | F lineDescription | G oldQty | H oldUnit | I derivedQty |
+  // J derivedUnit | K unitPrice | L amount | M derivationReason | N cronMode
+  //
+  // First-run setup: Kevin creates the tab manually with the header row above.
+  // If the tab doesn't exist, this block logs the failure and continues; the
+  // log writes start landing as soon as the tab exists.
+  if (catchWeightDetections.length > 0) {
+    try {
+      const rows = catchWeightDetections.map((d) => [
+        d.timestamp, d.account, d.vendor, d.invoiceUuid, d.invoiceNumber,
+        d.description, d.oldQty, d.oldUnit, d.derivedQty, d.derivedUnit,
+        d.unitPrice, d.amount, d.derivationReason, d.cronMode,
+      ]);
+      await appendRows(INVENTORY_SHEET_ID, "catchweight_derivations_log!A1", rows);
+      console.log(`[${accountTab}] [catchweight-log] appended ${rows.length} catch_weight_subline detection(s)`);
+    } catch (e) {
+      console.warn(`[${accountTab}] [catchweight-log] append failed (non-blocking): ${e.message}`);
+    }
+  }
 
   const summary = { account: accountTab, processed: newItems.length, matched, created, queued, held, skipped, invoiceHoldsHonored, linesDeferredByHold, creditsSkipped, linesSkippedByCredit };
 
