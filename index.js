@@ -1071,11 +1071,38 @@ async function processAccount(accountTab, pgCtx) {
     }
 
     if (r.action === "batch_match") {
-      // This item is the same product as another "new" item in this batch
+      // This item is the same product as another item in this batch. Resolve
+      // the canonical itemId through a fallback chain that handles the three
+      // valid upstream scenarios (the original code only handled scenario 1):
+      //
+      //   1. batchNewIds[refIndex] - ref took the "new" + confidence<60 path
+      //      and a fresh catalog row was created. The original happy path.
+      //   2. r.matchedItemId - Claude returned this batch_match WITH a match
+      //      target (e.g., ref was directly action="match" - Bug 1 scenario A2).
+      //   3. results[refIndex].matchedItemId - the ref was "match" or got
+      //      converted to "match" by the catalog-dedup pass (line 681), so the
+      //      itemId lives on the ref row (Bug 1 scenario A2').
+      //
+      // PRE-FIX BEHAVIOR (the bug): when only batchNewIds was checked and it
+      // was undefined, the "edge case" path created a fresh catalog row,
+      // producing 95% of the inventory_items dup population (verified
+      // 2026-06-11: 104 single-vendor dup groups / 133 excess rows).
+      //
+      // POST-FIX BEHAVIOR: if the chain resolves, add alias + price pointing
+      // to the resolved itemId (existing happy-path writes, unchanged byte-
+      // for-byte). If the chain fails, log a clear warning + skip - DO NOT
+      // create a phantom catalog row. The warning measures how often the
+      // remaining unresolved scenarios fire (Bug 1 scenario A1 = ref queued
+      // as possible_new; plus any Claude protocol violations), which informs
+      // whether a queue-this-batch-match-too branch is worth building later.
       const refIndex = r.batchRefIndex;
-      const refItemId = batchNewIds[refIndex];
+      const refRow = results[refIndex];
+      const refItemId =
+        batchNewIds[refIndex] ||
+        r.matchedItemId ||
+        refRow?.matchedItemId;
       if (refItemId) {
-        // Treat like a match — add alias + price history pointing to the batch-created item
+        // Treat like a match — add alias + price history pointing to the resolved itemId
         matched++;
         newAliasRows.push(shapes.makeAliasRow({
           aliasId:    `alias_${uid()}`,
@@ -1097,49 +1124,19 @@ async function processAccount(accountTab, pgCtx) {
           recordedAt:  now,
         }));
       } else {
-        // Reference not found (edge case) — create as new to avoid data loss
-        console.warn(`[${accountTab}] batch_match ref ${refIndex} not found for index ${r.index}, creating as new`);
-        created++;
-        const itemId = `item_${uid()}`;
-        batchNewIds[r.index] = itemId;
-        newCatalogRows.push(shapes.makeCatalogRow({
-          itemId:           itemId,
-          account:          accountTab,
-          name:             r.canonicalName || li.description,
-          category:         r.category || "Food",
-          unit:             r.unit || li.unit || "EA",
-          storage:          r.suggestedStorage || "dry",
-          vendor:           li.vendor,
-          price:            r.normalizedPrice || li.unitPrice,
-          invoiceDate:      li.invoiceDate,
-          vendor2:          li.vendor,
-          priceAtLastCount: "",
-          active:           "TRUE",
-          linkedToInvoice:  "TRUE",
-          isVariety:        r.isVarietyOf ? "TRUE" : "FALSE",
-          createdBy:        "ai_cron",
-          createdAt:        now,
-          updatedAt:        now,
-        }));
-        newAliasRows.push(shapes.makeAliasRow({
-          aliasId:    `alias_${uid()}`,
-          aliasText:  li.description,
-          itemId:     itemId,
-          vendor:     li.vendor,
-          confidence: 100,
-          learnedBy:  "ai_cron",
-          learnedAt:  now,
-          source:     "ai_cron",
-        }));
-        newPriceRows.push(shapes.makePriceRow({
-          itemId:      itemId,
-          account:     accountTab,
-          vendor:      li.vendor,
-          price:       r.normalizedPrice || li.unitPrice,
-          invoiceDate: li.invoiceDate,
-          invoiceUuid: li.invoiceUuid,
-          recordedAt:  now,
-        }));
+        // Unresolved: skip + warn. The pre-fix create-as-new path was the
+        // root cause of the inventory_items dup population. Skipping does
+        // not lose data - the line's invoiceUuid is still in the cron's
+        // processedInvoices set (it was a real line we processed), the
+        // alias/price are just not written for this orphan. If a real
+        // pattern emerges in the warn logs we'll address it with a
+        // dedicated branch (e.g. queue-as-possible_new) backed by the
+        // measured frequency.
+        skipped++;
+        const refDigest = refRow
+          ? `action=${refRow.action} confidence=${refRow.confidence} matchedItemId=${refRow.matchedItemId || "(none)"}`
+          : "(refRow missing)";
+        console.warn(`[${accountTab}] batch_match unresolved (skipping, was previously creating dup catalog row): index=${r.index} refIndex=${refIndex} ref=${refDigest}`);
       }
     }
   }
