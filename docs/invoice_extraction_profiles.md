@@ -385,6 +385,90 @@ genuinely can't recover.
 
 ---
 
+## Captain's log: input-format finding (2026-06-10, deferred)
+
+**Status:** Diagnostic complete. Fix DEFERRED to a separate focused effort. Not part of the
+Review Queue close-out.
+
+### The finding
+
+Production extraction sends rasterized images to Claude (`invoiceActions.js:1299-1304`). The
+EXTRACTION_PROMPT explicitly asks for 15 fields per line item (7 backwards-compat + 8 Stage A:
+itemNumber, packSize, orderedCount, shippedCount, uomRaw, amount, weightLineValue,
+catchWeightMarker). **With image input, Claude returns only the 7 backwards-compat fields.**
+Stage A is uniformly absent across all vendors, all months, including extractions as recent as
+2026-06-09.
+
+Held-out test (10 invoices x 5 vendors, run via `scripts/extraction-test-rig.mjs`) shows the
+same prompt **with PDF document input returns the full 15-field shape on 100% of lines**, with
+Stage A populated (weightLineValue, packSize, uomRaw, shippedCount filled where the invoice
+shows them). The prompt is correct. The input format gates whether Stage A populates.
+
+### The trap: image mode's apparent math-reconcile rate is partly fake
+
+Production image-mode math reconciles at ~85% (Sysco), ~94% (BEK), ~88% (GFS), ~83% (Cheney),
+100% (WCW). PDF-mode math reconciles at 26% / 88% / 55% / 17% / 100% on the same vendors.
+That looks like PDF input is dramatically worse.
+
+The side-by-side line-by-line diagnostic
+(`scripts/_probe_math_fail_diagnostic.mjs`) shows the cause: **PDF mode honestly returns
+`quantity: null` when shippedCount is genuinely uncertain. Image mode (production) appears to
+default to `quantity: 1`, which reconciles math by accident on some lines.** Same prompt rule
+(`quantity = shippedCount literal passthrough`, "use null when unclear"), different
+adherence per input format.
+
+On Sysco invoice 532396224: image mode shows `qty=1 case` for a catch-weight beef line, math
+`1 x $9.759 = $9.759 != $511.37` - so math fails for the legacy check there too. But on
+other non-catch-weight Sysco lines where shippedCount is unclear (pack info inline in
+description), image mode also returned `qty=1` and math reconciled by luck. **Current-year
+captured `ai_line_items` data contains an unknown fraction of guessed-1 quantities.**
+
+### Why this matters for the offseason
+
+The Review Queue close-out (skip + merge + math-reconcile via the dashboard) produces clean
+operator-confirmed quantities for the lines that DO reach the queue. But it does not address
+the lines that silently defaulted `quantity=1` and reconciled math by accident - those flow
+through to `price_history` and `item_catalog` unflagged. The offseason item-profile rebuild,
+built from this captured data, would inherit this hidden uncertainty.
+
+The honest fix (PDF input + handle the math-fail-due-to-null-shipped-count cases without
+silent defaults) is its own deliberate effort. Sequencing notes for that future work:
+
+1. **Probe gates everything.** The math-fail explosion under PDF input only flips to a win
+   if the cron's catch-weight derivation (`CRON_USE_DERIVATION` env var) is set to `live`.
+   In `shadow` or `off`, switching extraction to PDF input floods the queue. The env var
+   state at this writing: code default = `off` (`index.js:74`); Railway override unknown.
+2. **(B) question unresolved.** Why does image input drop 8 of 15 fields while the same
+   prompt with PDF input returns all 15? Hypotheses: visual-processing-mode bias, token
+   budget pressure, implicit truncation. Direct test needs Node-side rasterization
+   (`pdfjs-dist` + canvas, or pdf-to-png-converter) to send the same PDF as both
+   document AND images. Infrastructure not built.
+3. **Sysco specifically.** Even with PDF input, Sysco's invoice format puts pack info
+   ("5 LB", "4 GAL") inline in descriptions and doesn't expose a clear SHIPPED column.
+   `shippedCount` ends up null per the "no inference" rule -> `quantity` null -> legacy
+   math fails on non-catch-weight Sysco lines. PDF input alone doesn't solve Sysco; a
+   prompt-side cue ("for this vendor's format, infer 1 case when the line has no quantity
+   column") might be needed. Vendor-specific carve-out, deferred with the rest.
+4. **WCW is the no-regression baseline.** WCW math reconciles 100% in both modes. Whatever
+   shape the fix takes, WCW's `quantity` per-line values must not change.
+
+Held-out test infrastructure is in place (`scripts/extraction-test-rig.mjs` +
+`scripts/_probe_math_fail_diagnostic.mjs` + `scripts/_probe_extraction_baseline.mjs` in the
+intranet repo, untracked). Re-run against any candidate fix without re-building anything.
+
+### What is NOT being done now
+
+- No prompt change. The prompt is correct.
+- No production switch from image to PDF input.
+- No catch-weight modal in the Review Queue dashboard (the modal would help a class of lines
+  that mostly auto-resolve once the upstream extraction fix lands; building it now to handle
+  ~107 lines that should be auto-resolved is doomed-model polish).
+- No matcher pack/unit-awareness fix (the matcher needs the pack/unit fields to flow first,
+  which is gated on the extraction fix).
+
+These are deliberate deferrals, captured here so the next focused effort on data-capture
+quality can pick them up with the diagnostic state intact.
+
 ## Logged adjacent items (not extraction logic)
 
 - Duplicate `ai_line_items` rows from FIXED_RESUBMITTED re-uploads AND RAW/processed pairs - confirm
